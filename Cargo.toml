@@ -1,7 +1,9 @@
 [workspace]
+resolver = "3"
 members = [
     "simulation"
 ]
+
 
 [profile.release]
 lto = true
