@@ -19,4 +19,4 @@ This project visualizes the flow of 100,000+ network packets and simulates load 
 
 ## License
 **MIT License.**
-This is a portfolio project, created for learning purposes.
+This is a portfolio project.

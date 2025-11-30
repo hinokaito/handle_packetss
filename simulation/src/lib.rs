@@ -92,6 +92,19 @@ extern "C" {
     /// * `y` - Y coordinate on the canvas
     #[wasm_bindgen(js_namespace = window)]
     fn drawPacket(x: f64, y: f64);
+
+    /// Binding to JavaScript's `drawPackets()` function.
+    /// Draws multiple packets at once for better performance.
+    ///
+    /// # Parameters
+    ///
+    /// * `coords` - Float64Array containing [x0, y0, x1, y1, x2, y2, ...]
+    #[wasm_bindgen(js_namespace = window)]
+    fn drawPackets(coords: &[f64]);
+
+    /// Binding to JavaScript's `performance.now()` for timing.
+    #[wasm_bindgen(js_namespace = performance)]
+    fn now() -> f64;
 }
 
 // =============================================================================
@@ -163,25 +176,66 @@ pub fn console_log(message: &str) {
 /// ```
 #[wasm_bindgen]
 pub fn handle_message(message: &str) {
-    // Log the raw message first
-    log(&format!("[Rust/Wasm] Received: {}", message));
+    // Log message size for performance analysis
+    let msg_size = message.len();
+    log(&format!(
+        "[Rust/Wasm] Received: {} bytes ({:.2} KB)",
+        msg_size,
+        msg_size as f64 / 1024.0
+    ));
 
-    // Try to parse as JSON (Packet struct)
+    // Try to parse as JSON array first (multiple packets)
+    let start_parse = now();
+    if let Ok(packets) = serde_json::from_str::<Vec<Packet>>(message) {
+        let parse_time = now() - start_parse;
+
+        log(&format!(
+            "[Rust/Wasm] Parsed {} packets in {:.2}ms",
+            packets.len(),
+            parse_time
+        ));
+
+        // Convert packets to flat coordinate array for batch drawing
+        let start_convert = now();
+        let coords: Vec<f64> = packets
+            .iter()
+            .flat_map(|p| [p.x, p.y])
+            .collect();
+        let convert_time = now() - start_convert;
+
+        // Draw all packets at once
+        let start_draw = now();
+        drawPackets(&coords);
+        let draw_time = now() - start_draw;
+
+        // Performance summary
+        log(&format!(
+            "[Rust/Wasm] Performance: parse={:.2}ms, convert={:.2}ms, draw={:.2}ms, total={:.2}ms",
+            parse_time,
+            convert_time,
+            draw_time,
+            parse_time + convert_time + draw_time
+        ));
+        log(&format!(
+            "[Rust/Wasm] JSON overhead: {:.2} bytes/packet",
+            msg_size as f64 / packets.len() as f64
+        ));
+
+        return;
+    }
+
+    // Try to parse as single Packet
     match serde_json::from_str::<Packet>(message) {
         Ok(packet) => {
-            // Successfully parsed! Log the structured data
             log(&format!(
-                "[Rust/Wasm] Parsed Packet: id={}, x={}, y={}",
+                "[Rust/Wasm] Parsed single Packet: id={}, x={}, y={}",
                 packet.id, packet.x, packet.y
             ));
-
-            // Step 3: Draw the packet on the canvas!
             drawPacket(packet.x, packet.y);
-            log("[Rust/Wasm] Called drawPacket()");
         }
         Err(_) => {
-            // Not a valid Packet JSON - that's OK, might be plain text like "Hello"
-            log("[Rust/Wasm] Message is not a Packet JSON (plain text)");
+            // Plain text message (like "Hello")
+            log(&format!("[Rust/Wasm] Plain text: {}", message));
         }
     }
 }
@@ -220,19 +274,31 @@ pub fn main() {
     // - start_animation_loop()
 }
 
-// =============================================================================
-// INTERNAL HELPERS (Not exported to JavaScript)
-// =============================================================================
-
-// TODO: Add internal helper functions here as the project grows
-//
-// Examples of future functions:
-//
-// /// Parses a binary packet from the server
-// fn parse_packet(data: &[u8]) -> Packet { ... }
-//
-// /// Updates the simulation state with new packet data
-// fn update_simulation(packets: Vec<Packet>) { ... }
-//
-// /// Renders the current state using WebGPU
-// fn render_frame() { ... }
+/// バイナリデータをパースする関数
+#[wasm_bindgen]
+pub fn handle_binary(data: &[u8]) {
+    // 8バイト = 1パケット
+    let packet_count = data.len() / 8;
+    
+    let mut coords: Vec<f64> = Vec::with_capacity(packet_count * 2);
+    
+    for i in 0..packet_count {
+        let offset = i * 8;
+        
+        // ID (4 bytes) - 今回は使わない
+        // let id = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        
+        // X (2 bytes) → f64 に復元
+        let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
+        let x = (x16 as f64) * 800.0 / 65535.0;
+        
+        // Y (2 bytes) → f64 に復元
+        let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
+        let y = (y16 as f64) * 600.0 / 65535.0;
+        
+        coords.push(x);
+        coords.push(y);
+    }
+    
+    drawPackets(&coords);
+}
