@@ -187,6 +187,32 @@ How to Run:
         #packetCanvas {
             display: block;
             background: #0d1117;   /* Dark background */
+            width: 100%;           /* Responsive width */
+            height: auto;
+        }
+        
+        /* ====================================================================
+           PERFORMANCE STATS DISPLAY
+           ==================================================================== */
+        
+        .stats {
+            display: flex;
+            gap: 1.5rem;
+            padding: 0.75rem 1rem;
+            background: #21262d;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+        }
+        
+        .stats span {
+            color: #8b949e;
+        }
+        
+        .stats strong {
+            color: #58a6ff;
+            font-weight: bold;
         }
         
         /* ====================================================================
@@ -297,7 +323,14 @@ How to Run:
              White squares are drawn at (x, y) coordinates received from the server.
         -->
         <div class="canvas-container">
-            <canvas id="packetCanvas" width="400" height="300"></canvas>
+            <canvas id="packetCanvas" width="800" height="600"></canvas>
+        </div>
+        
+        <!-- Performance Stats Display -->
+        <div class="stats" id="statsContainer">
+            <span>Packets: <strong id="packetCount">0</strong></span>
+            <span>JSON Size: <strong id="jsonSize">0 KB</strong></span>
+            <span>Draw Time: <strong id="drawTime">0ms</strong></span>
         </div>
         
         <!-- Log Container
@@ -309,10 +342,12 @@ How to Run:
         <!-- Control Buttons
              - Connect: Toggles WebSocket connection (Connect/Disconnect)
              - Send Test: Sends a test message to the server (disabled when not connected)
+             - Clear: Clears the canvas
         -->
         <div class="controls">
             <button id="connectBtn">Connect</button>
             <button id="sendBtn" disabled>Send Test</button>
+            <button id="clearBtn">Clear Canvas</button>
         </div>
     </div>
 
@@ -339,7 +374,7 @@ How to Run:
         // - init: Initializes the Wasm module (loads and compiles the .wasm file)
         // - handle_message: Passes WebSocket messages to Rust for processing
         // - console_log: Calls console.log from Rust (for demonstration)
-        import init, { handle_message, console_log } from './pkg/simulation.js';
+        import init, { handle_message, handle_binary, console_log } from './pkg/simulation.js';
         
         // =====================================================================
         // STATE VARIABLES
@@ -364,6 +399,16 @@ How to Run:
         const canvas = document.getElementById('packetCanvas');
         const ctx = canvas.getContext('2d');
         
+        // Stats elements
+        const packetCountEl = document.getElementById('packetCount');
+        const jsonSizeEl = document.getElementById('jsonSize');
+        const drawTimeEl = document.getElementById('drawTime');
+        const clearBtn = document.getElementById('clearBtn');
+        
+        // Performance tracking
+        let totalPackets = 0;
+        let lastJsonSize = 0;
+        
         // =====================================================================
         // CANVAS DRAWING FUNCTIONS (Step 3)
         // =====================================================================
@@ -372,28 +417,58 @@ How to Run:
          * Draws a white square at the specified coordinates.
          * This function is called from Rust/Wasm via window.drawPacket().
          * 
-         * @param {number} x - X coordinate (scaled to canvas width)
-         * @param {number} y - Y coordinate (scaled to canvas height)
+         * @param {number} x - X coordinate (0-800)
+         * @param {number} y - Y coordinate (0-600)
          */
         window.drawPacket = function(x, y) {
-            // Clear the canvas first (optional: comment out to accumulate packets)
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            // Set the fill color to white
             ctx.fillStyle = '#ffffff';
-            
-            // Draw a 20x20 white square centered at (x, y)
-            // Scale coordinates: server sends 0-800 for x, 0-600 for y
-            // Canvas is 400x300, so we scale by 0.5
-            const scaledX = x * (canvas.width / 800);
-            const scaledY = y * (canvas.height / 600);
-            const size = 20;
-            
-            ctx.fillRect(scaledX - size/2, scaledY - size/2, size, size);
-            
-            // Log to UI
-            addLog('JS', `Drew packet at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+            const size = 4;
+            ctx.fillRect(x - size/2, y - size/2, size, size);
+            totalPackets++;
+            packetCountEl.textContent = totalPackets;
         };
+        
+        /**
+         * Draws multiple packets at once for better performance.
+         * This function is called from Rust/Wasm via window.drawPackets().
+         * 
+         * @param {Float64Array} coords - Flat array of [x0, y0, x1, y1, x2, y2, ...]
+         */
+        window.drawPackets = function(coords) {
+            const startTime = performance.now();
+            
+            // Set drawing style once for all packets
+            ctx.fillStyle = '#ffffff';
+            const size = 4;
+            
+            // Draw each packet
+            const packetCount = coords.length / 2;
+            for (let i = 0; i < coords.length; i += 2) {
+                const x = coords[i];
+                const y = coords[i + 1];
+                ctx.fillRect(x - size/2, y - size/2, size, size);
+            }
+            
+            const drawTime = performance.now() - startTime;
+            
+            // Update stats
+            totalPackets += packetCount;
+            packetCountEl.textContent = totalPackets;
+            drawTimeEl.textContent = drawTime.toFixed(2) + 'ms';
+            
+            addLog('JS', `Drew ${packetCount} packets in ${drawTime.toFixed(2)}ms`);
+        };
+        
+        /**
+         * Clears the canvas and resets the packet count.
+         */
+        function clearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            totalPackets = 0;
+            packetCountEl.textContent = '0';
+            drawTimeEl.textContent = '0ms';
+            addLog('JS', 'Canvas cleared');
+        }
         
         // =====================================================================
         // UTILITY FUNCTIONS
@@ -517,15 +592,18 @@ How to Run:
             // Data flow:
             // Go Server -> WebSocket -> onmessage -> handle_message() -> Rust/Wasm
             ws.onmessage = (event) => {
-                // Log the received message
-                addLog('WS', `Received: "${event.data}"`);
-                
-                // Pass the message to Rust/Wasm for processing
-                // This demonstrates JS -> Wasm communication
+            // Check if the message is binary or text
+            if (event.data instanceof Blob) {
+                // Binary message
+                event.data.arrayBuffer().then(buffer => {
+                    const bytes = new Uint8Array(buffer);
+                    handle_binary(bytes);  // Call the Rust function
+                });
+            } else {
+                // Text message (JSON)
                 handle_message(event.data);
-                
-                addLog('JS', 'Passed message to Rust/Wasm');
-            };
+            }
+        };
             
             // -------------------------------------------------------------
             // Event: Connection closed
@@ -605,6 +683,7 @@ How to Run:
         // Button click handlers
         connectBtn.addEventListener('click', connect);
         sendBtn.addEventListener('click', sendTest);
+        clearBtn.addEventListener('click', clearCanvas);
         
         // =====================================================================
         // APPLICATION ENTRY POINT

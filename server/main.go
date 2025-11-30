@@ -39,9 +39,12 @@
 package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"log"
+	"math/rand"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -176,31 +179,33 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Println("Sent: Hello")
 
 	// -------------------------------------------------------------------------
-	// Step 2.5: Send a JSON packet (demonstrates structured data)
+	// Step 2.5: Send packets as BINARY
 	// -------------------------------------------------------------------------
-	//
-	// This sends a Packet struct serialized as JSON.
-	// The Rust/Wasm side will parse this and extract the fields.
-	//
-	// JSON format: {"id": 1, "x": 10.5, "y": 20.0}
-	packet := Packet{
-		ID: 1,
-		X:  10.5,
-		Y:  20.0,
+	const packetCount = 100000
+
+	// Generate random packets
+	packets := make([]Packet, packetCount)
+	for i := 0; i < packetCount; i++ {
+		packets[i] = Packet{
+			ID: uint32(i),
+			X:  rand.Float64() * 800.0,
+			Y:  rand.Float64() * 600.0,
+		}
 	}
 
-	packetJSON, err := json.Marshal(packet)
+	// Encode and send
+	startEncode := time.Now()
+	binaryData := encodePacketsBinary(packets)
+	encodeDuration := time.Since(startEncode)
+
+	err = conn.WriteMessage(websocket.BinaryMessage, binaryData)
 	if err != nil {
-		log.Printf("JSON marshal error: %v", err)
+		log.Printf("Binary write error: %v", err)
 		return
 	}
 
-	err = conn.WriteMessage(websocket.TextMessage, packetJSON)
-	if err != nil {
-		log.Printf("Write error: %v", err)
-		return
-	}
-	log.Printf("Sent JSON: %s", packetJSON)
+	log.Printf("Sent %d packets (%d bytes, %.2f KB) in %v",
+		packetCount, len(binaryData), float64(len(binaryData))/1024, encodeDuration)
 
 	// -------------------------------------------------------------------------
 	// Step 3: Message read loop (main event loop)
@@ -258,6 +263,38 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+// =============================================================================
+// BINARY ENCODING FUNCTION
+// =============================================================================
+//
+// # Create a binary encoding function for the Packet struct
+//
+// Binary format (8 bytes per packet):
+// ┌──────────────────────────────────────────────────┐
+// │ ID (4 bytes) │ X (2 bytes) │ Y (2 bytes)         │
+// └──────────────────────────────────────────────────┘
+//
+// func encodePackets(packets []Packet) []byte { ... }
+// func decodePackets(data []byte) []Packet { ... }
+func encodePacketsBinary(packets []Packet) []byte {
+	buf := new(bytes.Buffer)
+
+	for _, p := range packets {
+		// ID (4 bytes, Little Endian)
+		binary.Write(buf, binary.LittleEndian, p.ID)
+
+		// X coordinate to uint16 (0-800 → 0-65535)
+		x16 := uint16(p.X * 65535.0 / 800.0)
+		binary.Write(buf, binary.LittleEndian, x16)
+
+		// Y coordinate to uint16 (0-600 → 0-65535)
+		y16 := uint16(p.Y * 65535.0 / 600.0)
+		binary.Write(buf, binary.LittleEndian, y16)
+	}
+
+	return buf.Bytes()
 }
 
 // =============================================================================
