@@ -39,11 +39,26 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 
 	"github.com/gorilla/websocket"
 )
+
+// =============================================================================
+// DATA STRUCTURES
+// =============================================================================
+
+// Packet represents a single packet in the simulation.
+// This structure is serialized to JSON and sent to the browser.
+//
+// JSON format: {"id": 1, "x": 10.5, "y": 20.0}
+type Packet struct {
+	ID uint32  `json:"id"` // Unique identifier for the packet
+	X  float64 `json:"x"`  // X coordinate (0.0 - 800.0)
+	Y  float64 `json:"y"`  // Y coordinate (0.0 - 600.0)
+}
 
 // =============================================================================
 // WEBSOCKET CONFIGURATION
@@ -151,24 +166,41 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Println("Client connected!")
 
 	// -------------------------------------------------------------------------
-	// Step 2: Send initial greeting message
+	// Step 2: Send initial greeting message (plain text)
 	// -------------------------------------------------------------------------
-	//
-	// This demonstrates server-initiated messages.
-	// The frontend will receive this immediately upon connection.
-	//
-	// Message types available:
-	//   - TextMessage (1): UTF-8 encoded text
-	//   - BinaryMessage (2): Raw binary data
-	//   - CloseMessage (8): Connection close signal
-	//   - PingMessage (9): Keepalive ping
-	//   - PongMessage (10): Response to ping
 	err = conn.WriteMessage(websocket.TextMessage, []byte("Hello"))
 	if err != nil {
 		log.Printf("Write error: %v", err)
 		return
 	}
 	log.Println("Sent: Hello")
+
+	// -------------------------------------------------------------------------
+	// Step 2.5: Send a JSON packet (demonstrates structured data)
+	// -------------------------------------------------------------------------
+	//
+	// This sends a Packet struct serialized as JSON.
+	// The Rust/Wasm side will parse this and extract the fields.
+	//
+	// JSON format: {"id": 1, "x": 10.5, "y": 20.0}
+	packet := Packet{
+		ID: 1,
+		X:  10.5,
+		Y:  20.0,
+	}
+
+	packetJSON, err := json.Marshal(packet)
+	if err != nil {
+		log.Printf("JSON marshal error: %v", err)
+		return
+	}
+
+	err = conn.WriteMessage(websocket.TextMessage, packetJSON)
+	if err != nil {
+		log.Printf("Write error: %v", err)
+		return
+	}
+	log.Printf("Sent JSON: %s", packetJSON)
 
 	// -------------------------------------------------------------------------
 	// Step 3: Message read loop (main event loop)

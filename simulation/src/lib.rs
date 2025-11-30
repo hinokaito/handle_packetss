@@ -29,7 +29,35 @@
 //! - Add wgpu-based WebGPU/WebGL rendering
 //! - Create load balancing algorithm simulations
 
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+
+// =============================================================================
+// DATA STRUCTURES
+// =============================================================================
+
+/// Represents a single packet in the simulation.
+///
+/// This struct mirrors the Go server's Packet struct.
+/// It's used to deserialize JSON data received via WebSocket.
+///
+/// # JSON Format
+///
+/// ```json
+/// {"id": 1, "x": 10.5, "y": 20.0}
+/// ```
+///
+/// # Fields
+///
+/// * `id` - Unique identifier for the packet
+/// * `x` - X coordinate (0.0 - 800.0, matching canvas width)
+/// * `y` - Y coordinate (0.0 - 600.0, matching canvas height)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Packet {
+    pub id: u32,
+    pub x: f64,
+    pub y: f64,
+}
 
 // =============================================================================
 // JAVASCRIPT BINDINGS (FFI - Foreign Function Interface)
@@ -132,13 +160,26 @@ pub fn console_log(message: &str) {
 /// ```
 #[wasm_bindgen]
 pub fn handle_message(message: &str) {
-    // Log the received message with a prefix to identify it came from Wasm
+    // Log the raw message first
     log(&format!("[Rust/Wasm] Received: {}", message));
 
-    // TODO: In the future, this will:
-    // 1. Deserialize the message (JSON or binary)
-    // 2. Update the internal simulation state
-    // 3. Trigger a re-render of the visualization
+    // Try to parse as JSON (Packet struct)
+    match serde_json::from_str::<Packet>(message) {
+        Ok(packet) => {
+            // Successfully parsed! Log the structured data
+            log(&format!(
+                "[Rust/Wasm] Parsed Packet: id={}, x={}, y={}",
+                packet.id, packet.x, packet.y
+            ));
+
+            // TODO: In Step 3, we'll use these coordinates for rendering:
+            // render_packet(packet.x, packet.y);
+        }
+        Err(_) => {
+            // Not a valid Packet JSON - that's OK, might be plain text like "Hello"
+            log(&format!("[Rust/Wasm] Message is not a Packet JSON (plain text)"));
+        }
+    }
 }
 
 /// Entry point for the Wasm module.
