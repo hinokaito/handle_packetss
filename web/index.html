@@ -172,6 +172,24 @@ How to Run:
         }
         
         /* ====================================================================
+           CANVAS CONTAINER (Step 3)
+           ==================================================================== */
+        
+        /* Canvas wrapper for the packet visualization */
+        .canvas-container {
+            margin-bottom: 1rem;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        
+        /* The actual canvas element */
+        #packetCanvas {
+            display: block;
+            background: #0d1117;   /* Dark background */
+        }
+        
+        /* ====================================================================
            LOG CONTAINER
            ==================================================================== */
         
@@ -181,7 +199,7 @@ How to Run:
             border: 1px solid #30363d;
             border-radius: 6px;
             padding: 1rem;
-            height: 400px;
+            height: 200px;         /* Reduced height to make room for canvas */
             overflow-y: auto;      /* Enable vertical scrolling */
             font-size: 0.9rem;
         }
@@ -274,6 +292,14 @@ How to Run:
             <span id="statusText">Disconnected</span>
         </div>
         
+        <!-- Canvas Container (Step 3)
+             Displays the packet visualization.
+             White squares are drawn at (x, y) coordinates received from the server.
+        -->
+        <div class="canvas-container">
+            <canvas id="packetCanvas" width="400" height="300"></canvas>
+        </div>
+        
         <!-- Log Container
              Displays timestamped messages from JavaScript, Rust/Wasm, and WebSocket.
              Auto-scrolls to show latest messages.
@@ -328,12 +354,46 @@ How to Run:
         // =====================================================================
         
         // Cache DOM element references for performance
-        // (Avoids repeated getElementById calls)
-        const statusDot = document.getElementById('statusDot');     // Connection indicator dot
-        const statusText = document.getElementById('statusText');   // Connection status text
-        const logContainer = document.getElementById('logContainer'); // Log display area
-        const connectBtn = document.getElementById('connectBtn');   // Connect/Disconnect button
-        const sendBtn = document.getElementById('sendBtn');         // Send test message button
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const logContainer = document.getElementById('logContainer');
+        const connectBtn = document.getElementById('connectBtn');
+        const sendBtn = document.getElementById('sendBtn');
+        
+        // Canvas elements (Step 3)
+        const canvas = document.getElementById('packetCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // =====================================================================
+        // CANVAS DRAWING FUNCTIONS (Step 3)
+        // =====================================================================
+        
+        /**
+         * Draws a white square at the specified coordinates.
+         * This function is called from Rust/Wasm via window.drawPacket().
+         * 
+         * @param {number} x - X coordinate (scaled to canvas width)
+         * @param {number} y - Y coordinate (scaled to canvas height)
+         */
+        window.drawPacket = function(x, y) {
+            // Clear the canvas first (optional: comment out to accumulate packets)
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Set the fill color to white
+            ctx.fillStyle = '#ffffff';
+            
+            // Draw a 20x20 white square centered at (x, y)
+            // Scale coordinates: server sends 0-800 for x, 0-600 for y
+            // Canvas is 400x300, so we scale by 0.5
+            const scaledX = x * (canvas.width / 800);
+            const scaledY = y * (canvas.height / 600);
+            const size = 20;
+            
+            ctx.fillRect(scaledX - size/2, scaledY - size/2, size, size);
+            
+            // Log to UI
+            addLog('JS', `Drew packet at (${x.toFixed(1)}, ${y.toFixed(1)})`);
+        };
         
         // =====================================================================
         // UTILITY FUNCTIONS

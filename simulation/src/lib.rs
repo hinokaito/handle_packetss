@@ -80,15 +80,18 @@ pub struct Packet {
 #[wasm_bindgen]
 extern "C" {
     /// Binding to JavaScript's `console.log()` function.
-    ///
-    /// The `js_namespace = console` attribute tells wasm-bindgen that this
-    /// function belongs to the `console` object in JavaScript.
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+
+    /// Binding to JavaScript's `drawPacket()` function.
+    /// This function is defined in index.html and draws a white square on the canvas.
     ///
     /// # Parameters
     ///
-    /// * `s` - The string message to log to the browser console
-    #[wasm_bindgen(js_namespace = console)]
-    fn log(s: &str);
+    /// * `x` - X coordinate on the canvas
+    /// * `y` - Y coordinate on the canvas
+    #[wasm_bindgen(js_namespace = window)]
+    fn drawPacket(x: f64, y: f64);
 }
 
 // =============================================================================
@@ -172,12 +175,13 @@ pub fn handle_message(message: &str) {
                 packet.id, packet.x, packet.y
             ));
 
-            // TODO: In Step 3, we'll use these coordinates for rendering:
-            // render_packet(packet.x, packet.y);
+            // Step 3: Draw the packet on the canvas!
+            drawPacket(packet.x, packet.y);
+            log("[Rust/Wasm] Called drawPacket()");
         }
         Err(_) => {
             // Not a valid Packet JSON - that's OK, might be plain text like "Hello"
-            log(&format!("[Rust/Wasm] Message is not a Packet JSON (plain text)"));
+            log("[Rust/Wasm] Message is not a Packet JSON (plain text)");
         }
     }
 }
