@@ -374,7 +374,25 @@ How to Run:
         // - init: Initializes the Wasm module (loads and compiles the .wasm file)
         // - handle_message: Passes WebSocket messages to Rust for processing
         // - console_log: Calls console.log from Rust (for demonstration)
-        import init, { handle_message, handle_binary, console_log } from './pkg/simulation.js';
+        // - Shared memory functions for zero-copy batch transfer:
+        //   - get_memory: Returns the Wasm linear memory object
+        //   - get_packet_buffer_ptr: Returns pointer to the packet data buffer
+        //   - get_packet_buffer_len: Returns current length of the buffer
+        //   - allocate_packet_buffer: Pre-allocates buffer capacity
+        //   - update_packet_buffer_from_binary: Updates buffer from binary data
+        //   - update_packet_buffer_from_json: Updates buffer from JSON data
+        import init, { 
+            handle_message, 
+            handle_binary, 
+            console_log,
+            get_memory,
+            get_packet_buffer_ptr,
+            get_packet_buffer_len,
+            allocate_packet_buffer,
+            update_packet_buffer_from_binary,
+            update_packet_buffer_from_json,
+            clear_packet_buffer
+        } from './pkg/simulation.js';
         
         // =====================================================================
         // STATE VARIABLES
@@ -468,6 +486,114 @@ How to Run:
             packetCountEl.textContent = '0';
             drawTimeEl.textContent = '0ms';
             addLog('JS', 'Canvas cleared');
+        }
+        
+        // =====================================================================
+        // SHARED MEMORY ZERO-COPY DRAWING (High Performance)
+        // =====================================================================
+        
+        /**
+         * Draws packets using shared memory (zero-copy approach).
+         * 
+         * This function demonstrates the zero-copy batch transfer technique:
+         * 1. Rust updates the packet buffer in its linear memory
+         * 2. JavaScript gets a Float32Array view directly into that memory
+         * 3. No data copying occurs - JS reads Rust's memory directly!
+         * 
+         * Performance benefits:
+         * - No serialization/deserialization overhead
+         * - No memory allocation for transfer
+         * - Direct memory access is extremely fast
+         * 
+         * @param {number} packetCount - Number of packets to draw
+         */
+        function drawPacketsFromSharedMemory(packetCount) {
+            const startTime = performance.now();
+            
+            // Get the Wasm linear memory object
+            const memory = get_memory();
+            
+            // Get pointer and length from Rust
+            const ptr = get_packet_buffer_ptr();
+            const len = get_packet_buffer_len();
+            
+            // Create a Float32Array view directly into Wasm memory
+            // This is ZERO-COPY: no data is moved, we're just creating a view!
+            const coords = new Float32Array(memory.buffer, ptr, len);
+            
+            // Draw all packets using the shared memory view
+            ctx.fillStyle = '#ffffff';
+            const size = 4;
+            
+            for (let i = 0; i < len; i += 2) {
+                const x = coords[i];
+                const y = coords[i + 1];
+                ctx.fillRect(x - size/2, y - size/2, size, size);
+            }
+            
+            const drawTime = performance.now() - startTime;
+            
+            // Update stats
+            totalPackets += packetCount;
+            packetCountEl.textContent = totalPackets;
+            drawTimeEl.textContent = drawTime.toFixed(2) + 'ms';
+            
+            addLog('JS', `[Zero-Copy] Drew ${packetCount} packets in ${drawTime.toFixed(2)}ms`);
+        }
+        
+        /**
+         * Handles binary message using shared memory approach.
+         * 
+         * Data flow:
+         * 1. Binary data arrives via WebSocket
+         * 2. Rust parses binary and updates shared buffer
+         * 3. JS creates Float32Array view into Rust's memory (zero-copy!)
+         * 4. JS draws packets directly from shared memory
+         * 
+         * @param {Uint8Array} bytes - Binary packet data
+         */
+        function handleBinaryWithSharedMemory(bytes) {
+            const startTime = performance.now();
+            
+            // Rust parses binary data and updates the shared buffer
+            // Returns the number of packets written
+            const packetCount = update_packet_buffer_from_binary(bytes);
+            
+            const parseTime = performance.now() - startTime;
+            
+            // Draw using zero-copy shared memory access
+            drawPacketsFromSharedMemory(packetCount);
+            
+            addLog('JS', `[Shared Memory] Parse: ${parseTime.toFixed(2)}ms, Packets: ${packetCount}`);
+        }
+        
+        /**
+         * Handles JSON message using shared memory approach.
+         * 
+         * Even for JSON, we can benefit from shared memory:
+         * 1. Rust parses JSON and stores f32 coordinates in shared buffer
+         * 2. JS reads directly from shared memory (zero-copy for drawing!)
+         * 
+         * @param {string} jsonData - JSON string containing packet array
+         */
+        function handleJsonWithSharedMemory(jsonData) {
+            const startTime = performance.now();
+            
+            // Rust parses JSON and updates the shared buffer
+            const packetCount = update_packet_buffer_from_json(jsonData);
+            
+            if (packetCount === 0) {
+                // JSON parsing failed, fall back to original handler
+                handle_message(jsonData);
+                return;
+            }
+            
+            const parseTime = performance.now() - startTime;
+            
+            // Draw using zero-copy shared memory access
+            drawPacketsFromSharedMemory(packetCount);
+            
+            addLog('JS', `[Shared Memory JSON] Parse: ${parseTime.toFixed(2)}ms, Packets: ${packetCount}`);
         }
         
         // =====================================================================
@@ -589,21 +715,24 @@ How to Run:
             // -------------------------------------------------------------
             // Fired when the server sends a message
             // 
-            // Data flow:
-            // Go Server -> WebSocket -> onmessage -> handle_message() -> Rust/Wasm
+            // Data flow (Shared Memory / Zero-Copy approach):
+            // 1. Go Server -> WebSocket -> onmessage
+            // 2. Rust parses data and updates shared buffer
+            // 3. JS creates Float32Array view into Rust's memory (zero-copy!)
+            // 4. JS draws packets directly from shared memory
             ws.onmessage = (event) => {
-            // Check if the message is binary or text
-            if (event.data instanceof Blob) {
-                // Binary message
-                event.data.arrayBuffer().then(buffer => {
-                    const bytes = new Uint8Array(buffer);
-                    handle_binary(bytes);  // Call the Rust function
-                });
-            } else {
-                // Text message (JSON)
-                handle_message(event.data);
-            }
-        };
+                // Check if the message is binary or text
+                if (event.data instanceof Blob) {
+                    // Binary message - use shared memory approach for best performance
+                    event.data.arrayBuffer().then(buffer => {
+                        const bytes = new Uint8Array(buffer);
+                        handleBinaryWithSharedMemory(bytes);  // Zero-copy approach
+                    });
+                } else {
+                    // Text message (JSON) - use shared memory for drawing
+                    handleJsonWithSharedMemory(event.data);
+                }
+            };
             
             // -------------------------------------------------------------
             // Event: Connection closed
@@ -664,6 +793,13 @@ How to Run:
                 await init();
                 
                 addLog('JS', 'Wasm module loaded successfully!');
+                
+                // Pre-allocate shared memory buffer for packet data
+                // This reserves space for up to 100,000 packets to avoid
+                // reallocations during high-throughput data transfer
+                const MAX_PACKETS = 100000;
+                allocate_packet_buffer(MAX_PACKETS);
+                addLog('JS', `[Shared Memory] Pre-allocated buffer for ${MAX_PACKETS} packets`);
                 
                 // Test the Wasm console_log function
                 // This calls Rust code that logs to the browser console
