@@ -17,6 +17,22 @@ This project visualizes the flow of 100,000+ network packets and simulates load 
 - **Backend:** Go, QUIC-go
 - **Protocol:** WebTransport
 
+## usage
+
+### backend
+```bash
+cd server
+go run main.go
+```
+
+### frontend
+```bash
+cd web
+python -m http.server 8080
+```
+
+
 ## License
 **MIT License.**
 This is a portfolio project.
+
