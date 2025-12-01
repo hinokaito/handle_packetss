@@ -1,90 +1,528 @@
-//! # Simulation Module
-//!
-//! This is the core WebAssembly (Wasm) module for the packet traffic simulation.
-//! It serves as the bridge between JavaScript (browser) and Rust (Wasm),
-//! enabling high-performance computation in the browser environment.
-//!
-//! ## Architecture Overview
-//!
-//! ```text
-//! ┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
-//! │   Browser JS    │ ──── │   This Module    │ ──── │   Go Server     │
-//! │   (Frontend)    │      │   (Rust/Wasm)    │      │   (WebSocket)   │
-//! └─────────────────┘      └──────────────────┘      └─────────────────┘
-//! ```
-//!
-//! ## Current Status
-//!
-//! This module is in **Step 1** of development:
-//! - [x] Basic JS <-> Wasm interop
-//! - [x] Console logging from Rust
-//! - [x] Message handling from WebSocket
-//! - [ ] WebGPU/WebGL rendering (TODO)
-//! - [ ] Binary protocol parsing (TODO)
-//! - [ ] Simulation logic (TODO)
-//!
-//! ## Future Plans
-//!
-//! - Implement particle system for 100k+ packet visualization
-//! - Add wgpu-based WebGPU/WebGL rendering
-//! - Create load balancing algorithm simulations
-
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
+use web_sys::HtmlCanvasElement;
+use wgpu::*;
+use wgpu::util::DeviceExt;
+use bytemuck::{Pod, Zeroable};
 
 // =============================================================================
-// SHARED MEMORY BUFFER FOR ZERO-COPY DATA TRANSFER
+// WEBGPU RENDERER
 // =============================================================================
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+// シェーダーに時間を渡すためのユニフォームバッファ構造体。アライメント調整用のパディングを含む
+struct TimeUniform {
+    time: f32,
+    _padding: [f32; 7],
+}
 
-// Thread-local storage for the shared packet data buffer.
-// Using RefCell for interior mutability since Wasm is single-threaded.
-// The buffer stores packet coordinates as [x0, y0, x1, y1, ...] in f32 format.
+// WebGPUのデバイス、キュー、パイプラインなど、描画に必要なリソースをまとめて管理する構造体
+struct GpuRenderer {
+    device: Device,
+    queue: Queue,
+    render_pipeline: RenderPipeline,
+    packet_buffer: Buffer, // 描画したいパケットの座標データをGPUメモリ上に保持するための領域
+    packet_count: u32, // 現在バッファに含まれている、あるいは描画するべきパケットの数を管理する
+    surface: Surface<'static>, // 画面(この場合はHTMLの<canvas>要素)への描画領域を表す。レンダリング結果を最終的にユーザーに見せるための窓口
+    surface_config: SurfaceConfiguration, // サーフェスの設定情報を保持する。ウィンドウサイズが変わった際など、surfaceを再設定するために必要
+    canvas_width: u32,
+
+    canvas_height: u32,
+    time_buffer: Buffer,
+    time_bind_group: BindGroup,
+}
+
+
+// 初期化したGpuRendererインスタンスをプログラムのどこからでもアクセスできるように保持しておく場所。
+// [LEARN]thread_local!マクロを使用することで、「スレッドごとに1つ(=Wasm環境全体で実質1つ)の書き換え可能な永続データ」を安全に管理できる
+// GPUレンダラー置き場を作っておき、最初は空にする。
+// init_gpu関数で初期化が成功したら、ここにレンダラーを格納し、描画関数でここからレンダーを取り出して使う
 thread_local! {
+    // GpuRendererのインスタンスをスレッドローカル（Wasmでは実質グローバル）に保持するための変数
+    static GPU_RENDERER: RefCell<Option<GpuRenderer>> = RefCell::new(None);
+}
+
+// JavaScriptからRustへ大量のデータを渡す際や、計算結果を一時的に保持するための「使いまわし可能なメモリ領域」
+// 毎回新しいメモリを確保して開放するのは遅いため、このPACKET_BUFFERという「常駐する領域」を1つ用意しておく
+thread_local! {
+    // JSとRust間でデータをやり取りするための一時的な共有メモリバッファ
     static PACKET_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
-/// Returns the pointer (memory address) to the packet buffer.
-/// JavaScript can use this pointer to create a Float32Array view
-/// into the Wasm linear memory for zero-copy access.
-///
-/// # Safety
-///
-/// The returned pointer is valid as long as:
-/// - The buffer is not reallocated (capacity unchanged)
-/// - The buffer is not dropped
-///
-/// # Example (JavaScript)
-///
-/// ```javascript
-/// const ptr = wasm.get_packet_buffer_ptr();
-/// const len = wasm.get_packet_buffer_len();
-/// const coords = new Float32Array(wasm.memory.buffer, ptr, len);
-/// ```
+
+
+// WGSL言語で記述された頂点シェーダーとフラグメントシェーダーのソースコード
+const SHADER_SOURCE: &str = r#"
+struct TimeUniform {
+    time: f32,
+    _padding: vec3<f32>,
+}
+@group(0) @binding(0) var<uniform> time_data: TimeUniform;
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+    @location(0) packet_pos: vec2<f32>,
+) -> @builtin(position) vec4<f32> {
+    let size = 2.0;
+
+    var pos = vec2<f32>(0.0, 0.0);
+    if (vertex_index == 0u) {
+        pos = vec2<f32>(-size, -size);
+    } else if (vertex_index == 1u) {
+        pos = vec2<f32>( size, -size);
+    } else if (vertex_index == 2u) {
+        pos = vec2<f32>(-size,  size);
+    } else {
+        pos = vec2<f32>( size,  size); 
+    }
+    
+    // アニメーション計算: 時間とY座標を使ってX座標を揺らす
+    let wave = sin(time_data.time * 5.0 + packet_pos.y * 0.05) * 10.0;
+    let animated_pos = vec2<f32>(packet_pos.x + wave, packet_pos.y);
+
+    let canvas_width = 800.0;
+    let canvas_height = 600.0;
+    let world_pos = animated_pos + pos;
+    let x = (world_pos.x / canvas_width) * 2.0 - 1.0;
+    let y = 1.0 - (world_pos.y / canvas_height) * 2.0;
+    
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+}
+"#;
+
+// JSから呼び出されるWebGPU初期化のエントリーポイント。非同期処理のPromiseを返す
+#[wasm_bindgen]
+pub fn init_gpu(canvas_id: &str) -> JsValue {
+    let canvas_id = canvas_id.to_string();
+    wasm_bindgen_futures::future_to_promise(async move {
+        init_gpu_internal(&canvas_id)
+            .await
+            .map(|_| JsValue::TRUE)
+            .map_err(|e| e)
+    })
+    .into()
+}
+
+// 実際のWebGPU初期化処理を行う非同期関数。デバイスやパイプラインの作成を行う
+async fn init_gpu_internal(canvas_id: &str) -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no global Window exists"))?;
+
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("no Document exists"))?;
+
+    let canvas = document
+        .get_element_by_id(canvas_id)
+        .and_then(|e| e.dyn_into::<HtmlCanvasElement>().ok())
+        .ok_or_else(|| JsValue::from_str("canvas element not found"))?;
+
+    let canvas_width = canvas.width();
+    let canvas_height = canvas.height();
+
+    log(&format!(
+        "[Rust/Wasm] Initializing WebGPU for canvas {}x{}",
+        canvas_width, canvas_height
+    ));
+
+    let instance = Instance::new(&InstanceDescriptor {
+        backends: Backends::BROWSER_WEBGPU | Backends::GL,
+        ..Default::default()
+    });
+
+    let surface = instance
+        .create_surface(SurfaceTarget::Canvas(canvas))
+        .expect("Failed to create surface");
+
+    let adapter = match instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        })
+        .await
+    {
+        Some(adapter) => adapter,
+        None => {
+            log("[Rust/Wasm] Failed to get WebGPU adapter");
+            return Err(JsValue::from_str("Failed to get WebGPU adapter"));
+        }
+    };
+
+    let (device, queue) = match adapter
+        .request_device(
+            &DeviceDescriptor {
+                label: None,
+                required_features: Features::empty(),
+                required_limits: Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                memory_hints: MemoryHints::default(),
+            },
+            None,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let err_msg = format!("Failed to get WebGPU device: {:?}", e);
+            log(&err_msg);
+            return Err(JsValue::from_str(&err_msg));
+        }
+    };
+
+    let surface_caps = surface.get_capabilities(&adapter);
+    let surface_format = surface_caps
+        .formats
+        .iter()
+        .find(|f| matches!(f, TextureFormat::Bgra8UnormSrgb | TextureFormat::Bgra8Unorm))
+        .copied()
+        .unwrap_or(surface_caps.formats[0]);
+
+    let surface_config = SurfaceConfiguration {
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: canvas_width,
+        height: canvas_height,
+        present_mode: surface_caps.present_modes[0],
+        alpha_mode: surface_caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+
+    surface.configure(&device, &surface_config);
+
+    let time_uniform = TimeUniform {
+        time: 0.0,
+        _padding: [0.0; 7],
+    };
+
+    let time_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Time Buffer"),
+        contents: bytemuck::cast_slice(&[time_uniform]),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+
+    let time_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+        label: Some("time_bind_group_layout"),
+    });
+
+    let time_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &time_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: time_buffer.as_entire_binding(),
+        }],
+        label: Some("time_bind_group"),
+    });
+
+    let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Render Pipeline Layout"),
+        bind_group_layouts: &[&time_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Packet Shader"),
+        source: ShaderSource::Wgsl(SHADER_SOURCE.into()),
+    });
+
+    let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Packet Render Pipeline"),
+        layout: Some(&render_pipeline_layout),
+        vertex: VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[VertexBufferLayout {
+                array_stride: std::mem::size_of::<f32>() as u64 * 2, 
+                step_mode: VertexStepMode::Instance,
+                attributes: &[VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            }],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: surface_config.format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    });
+
+    let max_packets = 100_000;
+    let packet_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Packet Buffer"),
+        size: (max_packets * 2 * std::mem::size_of::<f32>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let renderer = GpuRenderer {
+        device,
+        queue,
+        render_pipeline,
+        packet_buffer,
+        packet_count: 0,
+        surface,
+        surface_config,
+        canvas_width,
+        canvas_height,
+        time_buffer,
+        time_bind_group,
+    };
+
+    GPU_RENDERER.with(|r| {
+        *r.borrow_mut() = Some(renderer);
+    });
+
+    log("[Rust/Wasm] WebGPU initialized successfully!");
+    Ok(())
+}
+
+// 一度に描画できるパケットの最大数
+const MAX_PACKETS: usize = 100_000;
+
+// 与えられた座標データを使ってGPUでパケットを描画する関数
+fn render_packets_gpu(coords: &[f32]) {
+    GPU_RENDERER.with(|renderer_ref| {
+        let mut renderer_opt = renderer_ref.borrow_mut();
+        if let Some(renderer) = renderer_opt.as_mut() {
+            let total_packets = coords.len() / 2;
+            if total_packets == 0 {
+                log("[Rust/Wasm] No packets to render");
+                return;
+            }
+
+            let packet_count = total_packets.min(MAX_PACKETS);
+            let coords_to_render = &coords[0..(packet_count * 2)];
+
+            if total_packets > MAX_PACKETS {
+                log(&format!(
+                    "[Rust/Wasm] Warning: {} packets received, rendering only {} (buffer limit)",
+                    total_packets, packet_count
+                ));
+            } else {
+                log(&format!("[Rust/Wasm] Rendering {} packets", packet_count));
+            }
+
+            renderer.queue.write_buffer(
+                &renderer.packet_buffer,
+                0,
+                bytemuck::cast_slice(coords_to_render),
+            );
+
+            let current_time = (now() / 1000.0) as f32; 
+            let time_data = TimeUniform {
+                time: current_time,
+                _padding: [0.0; 7],
+            };
+            renderer.queue.write_buffer(
+                &renderer.time_buffer,
+                0,
+                bytemuck::cast_slice(&[time_data]),
+            );
+
+            let surface_texture = match renderer.surface.get_current_texture() {
+                Ok(texture) => texture,
+                Err(e) => {
+                    log(&format!(
+                        "[Rust/Wasm] Failed to get surface texture: {:?}",
+                        e
+                    ));
+                    return;
+                }
+            };
+
+            let view = surface_texture
+                .texture
+                .create_view(&TextureViewDescriptor::default());
+
+            {
+                let mut encoder =
+                    renderer
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor {
+                            label: Some("Render Encoder"),
+                        });
+
+                {
+                    let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Render Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color {
+                                    r: 0.050980392156862744, // #0d1117
+                                    g: 0.050980392156862744,
+                                    b: 0.09019607843137255,
+                                    a: 1.0,
+                                }),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+
+                    render_pass.set_pipeline(&renderer.render_pipeline);
+                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]); 
+                    let buffer_size = (packet_count * 2 * std::mem::size_of::<f32>()) as u64;
+                    render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
+                    render_pass.draw(0..4, 0..packet_count as u32);
+                }
+
+                renderer.queue.submit(Some(encoder.finish()));
+            }
+
+            surface_texture.present();
+            renderer.packet_count = packet_count as u32;
+            log(&format!(
+                "[Rust/Wasm] Rendered {} packets successfully",
+                packet_count
+            ));
+        } else {
+            log("[Rust/Wasm] GPU renderer not initialized");
+        }
+    });
+}
+
+// アニメーションフレームごとに呼び出され、画面を再描画する関数
+#[wasm_bindgen]
+pub fn render_frame() {
+    GPU_RENDERER.with(|renderer_ref| {
+        let mut renderer_opt = renderer_ref.borrow_mut();
+        if let Some(renderer) = renderer_opt.as_mut() {
+            let packet_count = renderer.packet_count as usize;
+            if packet_count == 0 {
+                return;
+            }
+
+            let current_time = (now() / 1000.0) as f32;
+            let time_data = TimeUniform {
+                time: current_time,
+                _padding: [0.0; 7],
+            };
+            renderer.queue.write_buffer(
+                &renderer.time_buffer,
+                0,
+                bytemuck::cast_slice(&[time_data]),
+            );
+
+            let surface_texture = match renderer.surface.get_current_texture() {
+                Ok(texture) => texture,
+                Err(_) => return,
+            };
+
+            let view = surface_texture
+                .texture
+                .create_view(&TextureViewDescriptor::default());
+
+            {
+                let mut encoder =
+                    renderer
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor {
+                            label: Some("Render Encoder"),
+                        });
+
+                {
+                    let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Render Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color {
+                                    r: 0.050980392156862744,
+                                    g: 0.050980392156862744,
+                                    b: 0.09019607843137255,
+                                    a: 1.0,
+                                }),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+
+                    render_pass.set_pipeline(&renderer.render_pipeline);
+                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]);
+                    let buffer_size = (packet_count * 2 * std::mem::size_of::<f32>()) as u64;
+                    render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
+                    render_pass.draw(0..4, 0..packet_count as u32);
+                }
+
+                renderer.queue.submit(Some(encoder.finish()));
+            }
+
+            surface_texture.present();
+        }
+    });
+}
+
+
+// 共有バッファのメモリアドレス（ポインタ）をJSに返す関数
 #[wasm_bindgen]
 pub fn get_packet_buffer_ptr() -> *const f32 {
     PACKET_BUFFER.with(|buffer| buffer.borrow().as_ptr())
 }
 
-/// Returns the current length (number of f32 elements) in the packet buffer.
-/// This equals (packet_count * 2) since each packet has x and y coordinates.
+// 共有バッファの現在の長さをJSに返す関数
 #[wasm_bindgen]
 pub fn get_packet_buffer_len() -> usize {
     PACKET_BUFFER.with(|buffer| buffer.borrow().len())
 }
 
-/// Pre-allocates the packet buffer to avoid reallocations during data updates.
-/// Call this once at initialization with the expected maximum packet count.
-///
-/// # Parameters
-///
-/// * `capacity` - Maximum number of packets to support (buffer will hold capacity * 2 floats)
+// 共有バッファのメモリ領域を指定サイズ分確保する関数
 #[wasm_bindgen]
 pub fn allocate_packet_buffer(capacity: usize) {
     PACKET_BUFFER.with(|buffer| {
         let mut buf = buffer.borrow_mut();
         buf.clear();
-        buf.reserve(capacity * 2); // x and y for each packet
+        buf.reserve(capacity * 2);
         log(&format!(
             "[Rust/Wasm] Allocated packet buffer with capacity for {} packets ({} bytes)",
             capacity,
@@ -93,8 +531,7 @@ pub fn allocate_packet_buffer(capacity: usize) {
     });
 }
 
-/// Clears the packet buffer without deallocating memory.
-/// This resets the length to 0 but keeps the allocated capacity.
+// 共有バッファの内容をクリアする関数
 #[wasm_bindgen]
 pub fn clear_packet_buffer() {
     PACKET_BUFFER.with(|buffer| {
@@ -102,18 +539,7 @@ pub fn clear_packet_buffer() {
     });
 }
 
-/// Updates the packet buffer with new binary data.
-/// Parses the binary format and stores coordinates as f32 for efficient JS access.
-///
-/// # Binary Format (8 bytes per packet)
-///
-/// ```text
-/// | id (4 bytes, u32) | x (2 bytes, u16) | y (2 bytes, u16) |
-/// ```
-///
-/// # Returns
-///
-/// The number of packets written to the buffer.
+// バイナリデータからパケット情報を読み取り、共有バッファを更新する関数
 #[wasm_bindgen]
 pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
     let packet_count = data.len() / 8;
@@ -122,7 +548,6 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
         let mut buf = buffer.borrow_mut();
         buf.clear();
 
-        // Ensure capacity to avoid reallocations
         let required = packet_count * 2;
         let current_capacity = buf.capacity();
         if current_capacity < required {
@@ -132,11 +557,9 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
         for i in 0..packet_count {
             let offset = i * 8;
 
-            // X coordinate: 2 bytes at offset+4, scaled to 0.0-800.0
             let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
             let x = (x16 as f32) * 800.0 / 65535.0;
 
-            // Y coordinate: 2 bytes at offset+6, scaled to 0.0-600.0
             let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
             let y = (y16 as f32) * 600.0 / 65535.0;
 
@@ -148,12 +571,7 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
     packet_count
 }
 
-/// Updates the packet buffer from JSON data.
-/// Parses JSON array of packets and stores coordinates as f32.
-///
-/// # Returns
-///
-/// The number of packets written to the buffer, or 0 if parsing failed.
+// JSON文字列からパケット情報を読み取り、共有バッファを更新する関数
 #[wasm_bindgen]
 pub fn update_packet_buffer_from_json(json_data: &str) -> usize {
     let packets: Vec<Packet> = match serde_json::from_str(json_data) {
@@ -165,7 +583,6 @@ pub fn update_packet_buffer_from_json(json_data: &str) -> usize {
         let mut buf = buffer.borrow_mut();
         buf.clear();
 
-        // Ensure capacity
         let required = packets.len() * 2;
         let current_capacity = buf.capacity();
         if current_capacity < required {
@@ -181,43 +598,14 @@ pub fn update_packet_buffer_from_json(json_data: &str) -> usize {
     })
 }
 
-/// Returns the Wasm linear memory object.
-/// JavaScript needs this to create typed array views into the shared buffer.
-///
-/// # Example (JavaScript)
-///
-/// ```javascript
-/// const memory = wasm.get_memory();
-/// const ptr = wasm.get_packet_buffer_ptr();
-/// const len = wasm.get_packet_buffer_len();
-/// const coords = new Float32Array(memory.buffer, ptr, len);
-/// // Now coords provides zero-copy access to Rust's packet data!
-/// ```
+// WasmのメモリインスタンスをJSに返す関数
 #[wasm_bindgen]
 pub fn get_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
-// =============================================================================
-// DATA STRUCTURES
-// =============================================================================
 
-/// Represents a single packet in the simulation.
-///
-/// This struct mirrors the Go server's Packet struct.
-/// It's used to deserialize JSON data received via WebSocket.
-///
-/// # JSON Format
-///
-/// ```json
-/// {"id": 1, "x": 10.5, "y": 20.0}
-/// ```
-///
-/// # Fields
-///
-/// * `id` - Unique identifier for the packet
-/// * `x` - X coordinate (0.0 - 800.0, matching canvas width)
-/// * `y` - Y coordinate (0.0 - 600.0, matching canvas height)
+// パケットのデータを表す構造体。JSONのシリアライズ/デシリアライズに対応
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
     pub id: u32,
@@ -225,124 +613,26 @@ pub struct Packet {
     pub y: f64,
 }
 
-// =============================================================================
-// JAVASCRIPT BINDINGS (FFI - Foreign Function Interface)
-// =============================================================================
-
-/// This `extern "C"` block declares functions that exist in JavaScript.
-/// `wasm-bindgen` generates the glue code to call these JS functions from Rust.
-///
-/// # How it works
-///
-/// 1. We declare the function signature here in Rust
-/// 2. `wasm-bindgen` generates JavaScript wrapper code
-/// 3. When Rust calls `log()`, it actually invokes `console.log()` in the browser
-///
-/// # Example
-///
-/// ```rust
-/// log("Hello from Rust!"); // This prints to browser's console
-/// ```
 #[wasm_bindgen]
+// JS側の関数（console.log, performance.now）をRustで使うための宣言
 extern "C" {
-    /// Binding to JavaScript's `console.log()` function.
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
 
-    /// Binding to JavaScript's `drawPacket()` function.
-    /// This function is defined in index.html and draws a white square on the canvas.
-    ///
-    /// # Parameters
-    ///
-    /// * `x` - X coordinate on the canvas
-    /// * `y` - Y coordinate on the canvas
-    #[wasm_bindgen(js_namespace = window)]
-    fn drawPacket(x: f64, y: f64);
-
-    /// Binding to JavaScript's `drawPackets()` function.
-    /// Draws multiple packets at once for better performance.
-    ///
-    /// # Parameters
-    ///
-    /// * `coords` - Float64Array containing [x0, y0, x1, y1, x2, y2, ...]
-    #[wasm_bindgen(js_namespace = window)]
-    fn drawPackets(coords: &[f64]);
-
-    /// Binding to JavaScript's `performance.now()` for timing.
     #[wasm_bindgen(js_namespace = performance)]
     fn now() -> f64;
 }
 
-// =============================================================================
-// PUBLIC API - Functions exported to JavaScript
-// =============================================================================
 
-/// Logs a message to the browser console from Rust/Wasm.
-///
-/// This function is exported to JavaScript and can be called from the browser.
-/// It's a simple wrapper around the `console.log()` binding.
-///
-/// # Parameters
-///
-/// * `message` - The message string to display in the browser console
-///
-/// # Example (JavaScript)
-///
-/// ```javascript
-/// import { console_log } from './pkg/simulation.js';
-/// console_log("Hello from JavaScript, through Rust!");
-/// ```
-///
-/// # Why use this instead of console.log directly?
-///
-/// This function demonstrates Wasm interop. In the future, this could be
-/// extended to:
-/// - Format messages with additional context
-/// - Filter log levels
-/// - Send logs to a remote server
+// JSのconsole.logをRustから使いやすくラップした関数
 #[wasm_bindgen]
 pub fn console_log(message: &str) {
     log(message);
 }
 
-/// Processes a message received from the WebSocket connection.
-///
-/// This is the main entry point for handling real-time data from the Go server.
-/// Currently, it just logs the received message, but this will be extended to:
-///
-/// - Parse binary packet data
-/// - Update simulation state
-/// - Trigger rendering updates
-///
-/// # Parameters
-///
-/// * `message` - The message string received from the WebSocket
-///
-/// # Data Flow
-///
-/// ```text
-/// Go Server ──WebSocket──> Browser JS ──> handle_message() ──> Process/Render
-/// ```
-///
-/// # Example (JavaScript)
-///
-/// ```javascript
-/// ws.onmessage = (event) => {
-///     handle_message(event.data);  // Pass WebSocket data to Rust
-/// };
-/// ```
-///
-/// # Future Implementation
-///
-/// ```rust
-/// // TODO: Parse binary packet format
-/// // let packets: Vec<Packet> = parse_binary(message);
-/// // simulation_state.update(packets);
-/// // renderer.queue_draw();
-/// ```
+// WebSocketなどで受信したメッセージ（JSONまたは文字列）を処理し、描画を行う関数
 #[wasm_bindgen]
 pub fn handle_message(message: &str) {
-    // Log message size for performance analysis
     let msg_size = message.len();
     log(&format!(
         "[Rust/Wasm] Received: {} bytes ({:.2} KB)",
@@ -350,7 +640,6 @@ pub fn handle_message(message: &str) {
         msg_size as f64 / 1024.0
     ));
 
-    // Try to parse as JSON array first (multiple packets)
     let start_parse = now();
     if let Ok(packets) = serde_json::from_str::<Vec<Packet>>(message) {
         let parse_time = now() - start_parse;
@@ -361,20 +650,17 @@ pub fn handle_message(message: &str) {
             parse_time
         ));
 
-        // Convert packets to flat coordinate array for batch drawing
         let start_convert = now();
-        let coords: Vec<f64> = packets
+        let coords: Vec<f32> = packets
             .iter()
-            .flat_map(|p| [p.x, p.y])
+            .flat_map(|p| [p.x as f32, p.y as f32])
             .collect();
         let convert_time = now() - start_convert;
 
-        // Draw all packets at once
         let start_draw = now();
-        drawPackets(&coords);
+        render_packets_gpu(&coords);
         let draw_time = now() - start_draw;
 
-        // Performance summary
         log(&format!(
             "[Rust/Wasm] Performance: parse={:.2}ms, convert={:.2}ms, draw={:.2}ms, total={:.2}ms",
             parse_time,
@@ -390,81 +676,46 @@ pub fn handle_message(message: &str) {
         return;
     }
 
-    // Try to parse as single Packet
     match serde_json::from_str::<Packet>(message) {
         Ok(packet) => {
             log(&format!(
                 "[Rust/Wasm] Parsed single Packet: id={}, x={}, y={}",
                 packet.id, packet.x, packet.y
             ));
-            drawPacket(packet.x, packet.y);
+            let coords = vec![packet.x as f32, packet.y as f32];
+            render_packets_gpu(&coords);
         }
         Err(_) => {
-            // Plain text message (like "Hello")
             log(&format!("[Rust/Wasm] Plain text: {}", message));
         }
     }
 }
 
-/// Entry point for the Wasm module.
-///
-/// This function is automatically called when the Wasm module is loaded.
-/// The `#[wasm_bindgen(start)]` attribute marks this as the module's
-/// initialization function.
-///
-/// # Lifecycle
-///
-/// 1. Browser loads `simulation.js`
-/// 2. `init()` is called (from JavaScript)
-/// 3. Wasm binary is fetched and compiled
-/// 4. This `main()` function runs automatically
-/// 5. Module is ready for use
-///
-/// # Current Implementation
-///
-/// Just logs an initialization message. In the future, this will:
-///
-/// - Initialize WebGPU/WebGL context
-/// - Set up rendering pipelines
-/// - Allocate memory for particle buffers
-/// - Start the render loop
+// Wasmモジュール読み込み時に自動実行されるエントリーポイント
 #[wasm_bindgen(start)]
 pub fn main() {
-    // Log initialization message to confirm the module loaded successfully
     log("[Rust/Wasm] Module initialized!");
-
-    // TODO: Future initialization steps:
-    // - init_webgpu_context()
-    // - create_render_pipeline()
-    // - allocate_particle_buffers()
-    // - start_animation_loop()
 }
 
-/// バイナリデータをパースする関数
+// バイナリ形式のパケットデータを受け取り、解析して描画する関数
 #[wasm_bindgen]
 pub fn handle_binary(data: &[u8]) {
-    // 8バイト = 1パケット
     let packet_count = data.len() / 8;
-    
-    let mut coords: Vec<f64> = Vec::with_capacity(packet_count * 2);
-    
+
+    let mut coords: Vec<f32> = Vec::with_capacity(packet_count * 2);
+
     for i in 0..packet_count {
         let offset = i * 8;
-        
-        // ID (4 bytes) - 今回は使わない
-        // let id = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-        
-        // X (2 bytes) → f64 に復元
+
         let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-        let x = (x16 as f64) * 800.0 / 65535.0;
-        
-        // Y (2 bytes) → f64 に復元
+        let x = (x16 as f32) * 800.0 / 65535.0;
+
         let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
-        let y = (y16 as f64) * 600.0 / 65535.0;
-        
+        let y = (y16 as f32) * 600.0 / 65535.0;
+
         coords.push(x);
         coords.push(y);
     }
-    
-    drawPackets(&coords);
+
+    render_packets_gpu(&coords);
 }
