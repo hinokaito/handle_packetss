@@ -1,10 +1,10 @@
+use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
-use wgpu::*;
 use wgpu::util::DeviceExt;
-use bytemuck::{Pod, Zeroable};
+use wgpu::*;
 
 // =============================================================================
 // WEBGPU RENDERER
@@ -23,7 +23,7 @@ struct GpuRenderer {
     queue: Queue,
     render_pipeline: RenderPipeline,
     packet_buffer: Buffer, // 描画したいパケットの座標データをGPUメモリ上に保持するための領域
-    packet_count: u32, // 現在バッファに含まれている、あるいは描画するべきパケットの数を管理する
+    packet_count: u32,     // 現在バッファに含まれている、あるいは描画するべきパケットの数を管理する
     surface: Surface<'static>, // 画面(この場合はHTMLの<canvas>要素)への描画領域を表す。レンダリング結果を最終的にユーザーに見せるための窓口
     surface_config: SurfaceConfiguration, // サーフェスの設定情報を保持する。ウィンドウサイズが変わった際など、surfaceを再設定するために必要
     canvas_width: u32,
@@ -32,7 +32,6 @@ struct GpuRenderer {
     time_buffer: Buffer,
     time_bind_group: BindGroup,
 }
-
 
 // 初期化したGpuRendererインスタンスをプログラムのどこからでもアクセスできるように保持しておく場所。
 // [LEARN]thread_local!マクロを使用することで、「スレッドごとに1つ(=Wasm環境全体で実質1つ)の書き換え可能な永続データ」を安全に管理できる
@@ -50,53 +49,11 @@ thread_local! {
     static PACKET_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
+const WIDTH: f32 = 800.0;
+const HEIGHT: f32 = 600.0;
 
-
-// WGSL言語で記述された頂点シェーダーとフラグメントシェーダーのソースコード
-const SHADER_SOURCE: &str = r#"
-struct TimeUniform {
-    time: f32,
-    _padding: vec3<f32>,
-}
-@group(0) @binding(0) var<uniform> time_data: TimeUniform;
-
-@vertex
-fn vs_main(
-    @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) instance_index: u32,
-    @location(0) packet_pos: vec2<f32>,
-) -> @builtin(position) vec4<f32> {
-    let size = 2.0;
-
-    var pos = vec2<f32>(0.0, 0.0);
-    if (vertex_index == 0u) {
-        pos = vec2<f32>(-size, -size);
-    } else if (vertex_index == 1u) {
-        pos = vec2<f32>( size, -size);
-    } else if (vertex_index == 2u) {
-        pos = vec2<f32>(-size,  size);
-    } else {
-        pos = vec2<f32>( size,  size); 
-    }
-    
-    // アニメーション計算: 時間とY座標を使ってX座標を揺らす
-    let wave = sin(time_data.time * 5.0 + packet_pos.y * 0.05) * 10.0;
-    let animated_pos = vec2<f32>(packet_pos.x + wave, packet_pos.y);
-
-    let canvas_width = 800.0;
-    let canvas_height = 600.0;
-    let world_pos = animated_pos + pos;
-    let x = (world_pos.x / canvas_width) * 2.0 - 1.0;
-    let y = 1.0 - (world_pos.y / canvas_height) * 2.0;
-    
-    return vec4<f32>(x, y, 0.0, 1.0);
-}
-
-@fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(1.0, 1.0, 1.0, 1.0);
-}
-"#;
+// WGSL言語で記述された頂点シェーダーとフラグメントシェーダーのソースコード（外部ファイルから読み込み）
+const SHADER_SOURCE: &str = include_str!("shader.wgsl");
 
 // JSから呼び出されるWebGPU初期化のエントリーポイント。非同期処理のPromiseを返す
 #[wasm_bindgen]
@@ -250,7 +207,7 @@ async fn init_gpu_internal(canvas_id: &str) -> Result<(), JsValue> {
             module: &shader,
             entry_point: Some("vs_main"),
             buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<f32>() as u64 * 2, 
+                array_stride: std::mem::size_of::<f32>() as u64 * 2,
                 step_mode: VertexStepMode::Instance,
                 attributes: &[VertexAttribute {
                     offset: 0,
@@ -351,7 +308,7 @@ fn render_packets_gpu(coords: &[f32]) {
                 bytemuck::cast_slice(coords_to_render),
             );
 
-            let current_time = (now() / 1000.0) as f32; 
+            let current_time = (now() / 1000.0) as f32;
             let time_data = TimeUniform {
                 time: current_time,
                 _padding: [0.0; 7],
@@ -407,7 +364,7 @@ fn render_packets_gpu(coords: &[f32]) {
                     });
 
                     render_pass.set_pipeline(&renderer.render_pipeline);
-                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]); 
+                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]);
                     let buffer_size = (packet_count * 2 * std::mem::size_of::<f32>()) as u64;
                     render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
                     render_pass.draw(0..4, 0..packet_count as u32);
@@ -503,7 +460,6 @@ pub fn render_frame() {
     });
 }
 
-
 // 共有バッファのメモリアドレス（ポインタ）をJSに返す関数
 #[wasm_bindgen]
 pub fn get_packet_buffer_ptr() -> *const f32 {
@@ -558,10 +514,10 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
             let offset = i * 8;
 
             let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-            let x = (x16 as f32) * 800.0 / 65535.0;
+            let x = (x16 as f32) * width / 65535.0;
 
             let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
-            let y = (y16 as f32) * 600.0 / 65535.0;
+            let y = (y16 as f32) * height / 65535.0;
 
             buf.push(x);
             buf.push(y);
@@ -604,7 +560,6 @@ pub fn get_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
-
 // パケットのデータを表す構造体。JSONのシリアライズ/デシリアライズに対応
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
@@ -622,7 +577,6 @@ extern "C" {
     #[wasm_bindgen(js_namespace = performance)]
     fn now() -> f64;
 }
-
 
 // JSのconsole.logをRustから使いやすくラップした関数
 #[wasm_bindgen]
@@ -708,10 +662,10 @@ pub fn handle_binary(data: &[u8]) {
         let offset = i * 8;
 
         let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-        let x = (x16 as f32) * 800.0 / 65535.0;
+        let x = (x16 as f32) * WIDTH / 65535.0;
 
         let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
-        let y = (y16 as f32) * 600.0 / 65535.0;
+        let y = (y16 as f32) * HEIGHT / 65535.0;
 
         coords.push(x);
         coords.push(y);
