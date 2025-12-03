@@ -49,8 +49,306 @@ thread_local! {
     static PACKET_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::new());
 }
 
+// シミュレーション状態をグローバルに保持（JSから複数回アクセスするため）
+thread_local! {
+    static SIMULATION_STATE: RefCell<Option<SimulationState>> = RefCell::new(None);
+}
+
 const WIDTH: f32 = 800.0;
 const HEIGHT: f32 = 600.0;
+
+// =============================================================================
+// SIMULATION ENGINE - パケット生成・シミュレーション
+// =============================================================================
+
+/// パケットタイプの列挙型
+#[wasm_bindgen]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PacketType {
+    Normal = 0,
+    SynFlood = 1,
+    HeavyTask = 2,
+    Killer = 3,
+}
+
+/// シミュレーション用パケット構造体
+/// WebGPUに渡すため#[repr(C)]でメモリレイアウトを固定
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Packet {
+    pub x: f32,
+    pub y: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub active: u32,      // 0: inactive, 1: active
+    pub packet_type: u32, // PacketType as u32
+    pub complexity: u8,   // 処理の重さ係数
+    pub _padding: [u8; 3], // アライメント用パディング
+}
+
+impl Default for Packet {
+    fn default() -> Self {
+        Packet {
+            x: 0.0,
+            y: 0.0,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            active: 0,
+            packet_type: 0,
+            complexity: 0,
+            _padding: [0; 3],
+        }
+    }
+}
+
+/// パケット生成予約タスク
+/// spawn_waveで登録し、tick()で徐々に生成する
+#[derive(Clone, Debug)]
+struct SpawnTask {
+    x: f32,
+    y: f32,
+    target_x: f32,
+    target_y: f32,
+    total_count: usize,      // 生成する総数
+    spawned_count: usize,    // 生成済みの数
+    duration_ms: f64,        // 何ミリ秒かけて放出するか
+    base_speed: f32,
+    speed_variance: f32,
+    packet_type: u32,
+    complexity: u8,
+    start_time: f64,         // タスク開始時刻（performance.now()）
+}
+
+/// シミュレーション状態を管理する構造体
+#[wasm_bindgen]
+pub struct SimulationState {
+    packets: Vec<Packet>,
+    max_packets: usize,
+    spawn_queue: Vec<SpawnTask>,
+    current_time: f64,
+}
+
+#[wasm_bindgen]
+impl SimulationState {
+    /// 新しいSimulationStateを作成
+    /// max_packets: 同時に存在できるパケットの最大数
+    #[wasm_bindgen(constructor)]
+    pub fn new(max_packets: usize) -> SimulationState {
+        let packets = vec![Packet::default(); max_packets];
+        log(&format!(
+            "[Rust/Wasm] SimulationState created with {} packet slots",
+            max_packets
+        ));
+        SimulationState {
+            packets,
+            max_packets,
+            spawn_queue: Vec::new(),
+            current_time: 0.0,
+        }
+    }
+
+    /// パケット生成予約を追加
+    /// Goから送られてくる生成情報を受け取り、spawn_queueに追加する
+    pub fn spawn_wave(
+        &mut self,
+        x: f32,
+        y: f32,
+        target_x: f32,
+        target_y: f32,
+        count: usize,
+        duration_ms: f64,
+        base_speed: f32,
+        speed_variance: f32,
+        packet_type: u32,
+        complexity: u8,
+    ) {
+        let task = SpawnTask {
+            x,
+            y,
+            target_x,
+            target_y,
+            total_count: count,
+            spawned_count: 0,
+            duration_ms,
+            base_speed,
+            speed_variance,
+            packet_type,
+            complexity,
+            start_time: self.current_time,
+        };
+        
+        log(&format!(
+            "[Rust/Wasm] spawn_wave: {} packets from ({}, {}) to ({}, {}), duration={}ms, speed={} ± {}",
+            count, x, y, target_x, target_y, duration_ms, base_speed, speed_variance
+        ));
+        
+        self.spawn_queue.push(task);
+    }
+
+    /// テスト用の簡易スポーン関数
+    /// 指定位置からランダムな方向にパケットを生成
+    pub fn debug_spawn(&mut self, x: f32, y: f32, count: usize) {
+        let mut spawned = 0;
+        for packet in self.packets.iter_mut() {
+            if packet.active == 0 {
+                packet.active = 1;
+                packet.x = x;
+                packet.y = y;
+                // ランダムな方向に散らばらせる
+                packet.velocity_x = (js_random() - 0.5) * 4.0;
+                packet.velocity_y = (js_random() - 0.5) * 4.0;
+                packet.packet_type = PacketType::Normal as u32;
+                packet.complexity = 10;
+
+                spawned += 1;
+                if spawned >= count {
+                    break;
+                }
+            }
+        }
+        log(&format!(
+            "[Rust/Wasm] debug_spawn: spawned {} packets at ({}, {})",
+            spawned, x, y
+        ));
+    }
+
+    /// 毎フレーム呼び出す更新関数
+    /// delta_ms: 前フレームからの経過時間（ミリ秒）
+    pub fn tick(&mut self, delta_ms: f64) {
+        self.current_time += delta_ms;
+        
+        // 1. spawn_queueを処理: 予約に基づいてパケットを生成
+        self.process_spawn_queue();
+        
+        // 2. アクティブなパケットを更新
+        self.update_packets(delta_ms);
+    }
+
+    /// アクティブなパケット数を返す
+    pub fn get_active_count(&self) -> usize {
+        self.packets.iter().filter(|p| p.active == 1).count()
+    }
+
+    /// WebGPU描画用にパケットメモリのポインタを返す
+    pub fn get_packets_ptr(&self) -> *const Packet {
+        self.packets.as_ptr()
+    }
+
+    /// 最大パケット数を返す
+    pub fn get_max_packets(&self) -> usize {
+        self.max_packets
+    }
+}
+
+// SimulationStateの内部実装（#[wasm_bindgen]なし）
+impl SimulationState {
+    /// spawn_queueを処理し、適切な数のパケットを生成
+    fn process_spawn_queue(&mut self) {
+        let current_time = self.current_time;
+        
+        // 完了したタスクを追跡
+        let mut completed_indices = Vec::new();
+        
+        for (idx, task) in self.spawn_queue.iter_mut().enumerate() {
+            let elapsed = current_time - task.start_time;
+            
+            // このフレームで生成すべき数を計算
+            let target_spawned = if task.duration_ms <= 0.0 {
+                // duration_ms が 0 なら即時全生成
+                task.total_count
+            } else {
+                // 経過時間に応じて線形に生成
+                let progress = (elapsed / task.duration_ms).min(1.0);
+                (task.total_count as f64 * progress) as usize
+            };
+            
+            let to_spawn = target_spawned.saturating_sub(task.spawned_count);
+            
+            if to_spawn > 0 {
+                // 方向ベクトルを計算（正規化）
+                let dx = task.target_x - task.x;
+                let dy = task.target_y - task.y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let (dir_x, dir_y) = if dist > 0.0 {
+                    (dx / dist, dy / dist)
+                } else {
+                    (1.0, 0.0) // targetが同じ位置なら右向き
+                };
+                
+                let mut actually_spawned = 0;
+                for packet in self.packets.iter_mut() {
+                    if packet.active == 0 && actually_spawned < to_spawn {
+                        // パケットを生成
+                        packet.active = 1;
+                        packet.x = task.x;
+                        packet.y = task.y;
+                        
+                        // 速度にばらつきを加える
+                        let speed = task.base_speed + (js_random() - 0.5) * 2.0 * task.speed_variance;
+                        packet.velocity_x = dir_x * speed;
+                        packet.velocity_y = dir_y * speed;
+                        
+                        packet.packet_type = task.packet_type;
+                        packet.complexity = task.complexity;
+                        
+                        actually_spawned += 1;
+                    }
+                }
+                
+                task.spawned_count += actually_spawned;
+            }
+            
+            // タスク完了チェック
+            if task.spawned_count >= task.total_count {
+                completed_indices.push(idx);
+            }
+        }
+        
+        // 完了したタスクを削除（逆順で削除してインデックスがずれないように）
+        for idx in completed_indices.into_iter().rev() {
+            self.spawn_queue.remove(idx);
+        }
+    }
+
+    /// アクティブなパケットの位置を更新
+    fn update_packets(&mut self, delta_ms: f64) {
+        // delta_msを秒に変換してスケーリング
+        let dt = delta_ms / 16.67; // 60FPS基準でスケーリング
+        
+        for packet in self.packets.iter_mut() {
+            if packet.active == 1 {
+                // 位置を更新
+                packet.x += packet.velocity_x * dt as f32;
+                packet.y += packet.velocity_y * dt as f32;
+                
+                // 画面外に出たら非アクティブに
+                if packet.x < -50.0 || packet.x > WIDTH + 50.0
+                    || packet.y < -50.0 || packet.y > HEIGHT + 50.0
+                {
+                    packet.active = 0;
+                }
+            }
+        }
+    }
+
+    /// アクティブなパケットの座標をf32配列として抽出（描画用）
+    pub fn get_active_coords(&self) -> Vec<f32> {
+        let mut coords = Vec::new();
+        for packet in &self.packets {
+            if packet.active == 1 {
+                coords.push(packet.x);
+                coords.push(packet.y);
+            }
+        }
+        coords
+    }
+}
+
+// JavaScriptのMath.random()を使用
+fn js_random() -> f32 {
+    js_sys::Math::random() as f32
+}
 
 // WGSL言語で記述された頂点シェーダーとフラグメントシェーダーのソースコード（外部ファイルから読み込み）
 const SHADER_SOURCE: &str = include_str!("shader.wgsl");
@@ -514,10 +812,10 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
             let offset = i * 8;
 
             let x16 = u16::from_le_bytes([data[offset + 4], data[offset + 5]]);
-            let x = (x16 as f32) * width / 65535.0;
+            let x = (x16 as f32) * WIDTH / 65535.0;
 
             let y16 = u16::from_le_bytes([data[offset + 6], data[offset + 7]]);
-            let y = (y16 as f32) * height / 65535.0;
+            let y = (y16 as f32) * HEIGHT / 65535.0;
 
             buf.push(x);
             buf.push(y);
@@ -530,7 +828,7 @@ pub fn update_packet_buffer_from_binary(data: &[u8]) -> usize {
 // JSON文字列からパケット情報を読み取り、共有バッファを更新する関数
 #[wasm_bindgen]
 pub fn update_packet_buffer_from_json(json_data: &str) -> usize {
-    let packets: Vec<Packet> = match serde_json::from_str(json_data) {
+    let packets: Vec<JsonPacket> = match serde_json::from_str(json_data) {
         Ok(p) => p,
         Err(_) => return 0,
     };
@@ -560,9 +858,9 @@ pub fn get_memory() -> JsValue {
     wasm_bindgen::memory()
 }
 
-// パケットのデータを表す構造体。JSONのシリアライズ/デシリアライズに対応
+// パケットのデータを表す構造体。JSONのシリアライズ/デシリアライズに対応（旧API用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Packet {
+pub struct JsonPacket {
     pub id: u32,
     pub x: f64,
     pub y: f64,
@@ -595,7 +893,7 @@ pub fn handle_message(message: &str) {
     ));
 
     let start_parse = now();
-    if let Ok(packets) = serde_json::from_str::<Vec<Packet>>(message) {
+    if let Ok(packets) = serde_json::from_str::<Vec<JsonPacket>>(message) {
         let parse_time = now() - start_parse;
 
         log(&format!(
@@ -630,7 +928,7 @@ pub fn handle_message(message: &str) {
         return;
     }
 
-    match serde_json::from_str::<Packet>(message) {
+    match serde_json::from_str::<JsonPacket>(message) {
         Ok(packet) => {
             log(&format!(
                 "[Rust/Wasm] Parsed single Packet: id={}, x={}, y={}",
@@ -672,4 +970,232 @@ pub fn handle_binary(data: &[u8]) {
     }
 
     render_packets_gpu(&coords);
+}
+
+// =============================================================================
+// SIMULATION API - JSからSimulationStateを操作するためのグローバル関数
+// =============================================================================
+
+/// シミュレーションを初期化
+#[wasm_bindgen]
+pub fn create_simulation(max_packets: usize) {
+    let sim = SimulationState::new(max_packets);
+    SIMULATION_STATE.with(|state| {
+        *state.borrow_mut() = Some(sim);
+    });
+    log(&format!(
+        "[Rust/Wasm] Simulation created with {} max packets",
+        max_packets
+    ));
+}
+
+/// シミュレーションにパケット生成予約を追加
+#[wasm_bindgen]
+pub fn simulation_spawn_wave(
+    x: f32,
+    y: f32,
+    target_x: f32,
+    target_y: f32,
+    count: usize,
+    duration_ms: f64,
+    base_speed: f32,
+    speed_variance: f32,
+    packet_type: u32,
+    complexity: u8,
+) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.spawn_wave(
+                x,
+                y,
+                target_x,
+                target_y,
+                count,
+                duration_ms,
+                base_speed,
+                speed_variance,
+                packet_type,
+                complexity,
+            );
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
+}
+
+/// テスト用: 指定位置からパケットを生成
+#[wasm_bindgen]
+pub fn simulation_debug_spawn(x: f32, y: f32, count: usize) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.debug_spawn(x, y, count);
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
+}
+
+/// シミュレーションを1フレーム進める
+#[wasm_bindgen]
+pub fn simulation_tick(delta_ms: f64) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.tick(delta_ms);
+        }
+    });
+}
+
+/// アクティブなパケット数を取得
+#[wasm_bindgen]
+pub fn simulation_get_active_count() -> usize {
+    SIMULATION_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|sim| sim.get_active_count())
+            .unwrap_or(0)
+    })
+}
+
+/// シミュレーションのパケットをWebGPUで描画
+#[wasm_bindgen]
+pub fn render_simulation_frame() {
+    // 1. SimulationStateからアクティブなパケットの座標を取得
+    let coords = SIMULATION_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|sim| sim.get_active_coords())
+            .unwrap_or_default()
+    });
+
+    if coords.is_empty() {
+        // パケットがない場合は画面クリアのみ
+        GPU_RENDERER.with(|renderer_ref| {
+            let mut renderer_opt = renderer_ref.borrow_mut();
+            if let Some(renderer) = renderer_opt.as_mut() {
+                renderer.packet_count = 0;
+                
+                let surface_texture = match renderer.surface.get_current_texture() {
+                    Ok(texture) => texture,
+                    Err(_) => return,
+                };
+
+                let view = surface_texture
+                    .texture
+                    .create_view(&TextureViewDescriptor::default());
+
+                let mut encoder =
+                    renderer
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor {
+                            label: Some("Clear Encoder"),
+                        });
+
+                {
+                    let _render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Clear Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color {
+                                    r: 0.050980392156862744,
+                                    g: 0.050980392156862744,
+                                    b: 0.09019607843137255,
+                                    a: 1.0,
+                                }),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+                }
+
+                renderer.queue.submit(Some(encoder.finish()));
+                surface_texture.present();
+            }
+        });
+        return;
+    }
+
+    // 2. GPUで描画
+    GPU_RENDERER.with(|renderer_ref| {
+        let mut renderer_opt = renderer_ref.borrow_mut();
+        if let Some(renderer) = renderer_opt.as_mut() {
+            let total_packets = coords.len() / 2;
+            let packet_count = total_packets.min(MAX_PACKETS);
+            let coords_to_render = &coords[0..(packet_count * 2)];
+
+            renderer.queue.write_buffer(
+                &renderer.packet_buffer,
+                0,
+                bytemuck::cast_slice(coords_to_render),
+            );
+
+            let current_time = (now() / 1000.0) as f32;
+            let time_data = TimeUniform {
+                time: current_time,
+                _padding: [0.0; 7],
+            };
+            renderer.queue.write_buffer(
+                &renderer.time_buffer,
+                0,
+                bytemuck::cast_slice(&[time_data]),
+            );
+
+            let surface_texture = match renderer.surface.get_current_texture() {
+                Ok(texture) => texture,
+                Err(_) => return,
+            };
+
+            let view = surface_texture
+                .texture
+                .create_view(&TextureViewDescriptor::default());
+
+            {
+                let mut encoder =
+                    renderer
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor {
+                            label: Some("Simulation Render Encoder"),
+                        });
+
+                {
+                    let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Simulation Render Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color {
+                                    r: 0.050980392156862744,
+                                    g: 0.050980392156862744,
+                                    b: 0.09019607843137255,
+                                    a: 1.0,
+                                }),
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    });
+
+                    render_pass.set_pipeline(&renderer.render_pipeline);
+                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]);
+                    let buffer_size = (packet_count * 2 * std::mem::size_of::<f32>()) as u64;
+                    render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
+                    render_pass.draw(0..4, 0..packet_count as u32);
+                }
+
+                renderer.queue.submit(Some(encoder.finish()));
+            }
+
+            surface_texture.present();
+            renderer.packet_count = packet_count as u32;
+        }
+    });
 }

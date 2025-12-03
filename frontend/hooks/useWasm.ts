@@ -16,6 +16,24 @@ export interface WasmModule {
   update_packet_buffer_from_binary: (data: Uint8Array) => number;
   update_packet_buffer_from_json: (jsonData: string) => number;
   console_log: (message: string) => void;
+  // Simulation API
+  create_simulation: (maxPackets: number) => void;
+  simulation_spawn_wave: (
+    x: number,
+    y: number,
+    targetX: number,
+    targetY: number,
+    count: number,
+    durationMs: number,
+    baseSpeed: number,
+    speedVariance: number,
+    packetType: number,
+    complexity: number
+  ) => void;
+  simulation_debug_spawn: (x: number, y: number, count: number) => void;
+  simulation_tick: (deltaMs: number) => void;
+  simulation_get_active_count: () => number;
+  render_simulation_frame: () => void;
 }
 
 export interface UseWasmReturn {
@@ -58,10 +76,20 @@ export function useWasm(): UseWasmReturn {
           update_packet_buffer_from_binary: wasmModule.update_packet_buffer_from_binary,
           update_packet_buffer_from_json: wasmModule.update_packet_buffer_from_json,
           console_log: wasmModule.console_log,
+          // Simulation API
+          create_simulation: wasmModule.create_simulation,
+          simulation_spawn_wave: wasmModule.simulation_spawn_wave,
+          simulation_debug_spawn: wasmModule.simulation_debug_spawn,
+          simulation_tick: wasmModule.simulation_tick,
+          simulation_get_active_count: wasmModule.simulation_get_active_count,
+          render_simulation_frame: wasmModule.render_simulation_frame,
         };
 
         // Pre-allocate packet buffer
         wasmModule.allocate_packet_buffer(MAX_PACKETS);
+        
+        // Initialize simulation
+        wasmModule.create_simulation(MAX_PACKETS);
         
         setIsLoaded(true);
         console.log('[useWasm] Wasm module loaded successfully');
