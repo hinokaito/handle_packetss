@@ -72,6 +72,27 @@ pub enum PacketType {
     Killer = 3,
 }
 
+/// ノードタイプの列挙型
+#[wasm_bindgen]
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NodeType {
+    Gateway = 0, // パケットの入口
+    LB = 1,      // ロードバランサー
+    Server = 2,  // アプリケーションサーバー
+    DB = 3,      // データベース
+}
+
+/// ノード構造体（目的地となるオブジェクト）
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Node {
+    pub x: f32,
+    pub y: f32,
+    pub id: u32,        // ユニークID（JS側での管理用）
+    pub node_type: u32, // NodeType as u32
+}
+
 /// シミュレーション用パケット構造体
 /// WebGPUに渡すため#[repr(C)]でメモリレイアウトを固定
 #[repr(C)]
@@ -81,10 +102,12 @@ pub struct Packet {
     pub y: f32,
     pub velocity_x: f32,
     pub velocity_y: f32,
-    pub active: u32,      // 0: inactive, 1: active
-    pub packet_type: u32, // PacketType as u32
-    pub complexity: u8,   // 処理の重さ係数
-    pub _padding: [u8; 3], // アライメント用パディング
+    pub active: u32,          // 0: inactive, 1: active
+    pub packet_type: u32,     // PacketType as u32
+    pub complexity: u8,       // 処理の重さ係数
+    pub _padding: [u8; 3],    // アライメント用パディング
+    pub target_node_idx: i32, // 目標ノードのインデックス (-1 = 宛先なし)
+    pub speed: f32,           // 移動速度（ピクセル/フレーム）
 }
 
 impl Default for Packet {
@@ -98,6 +121,8 @@ impl Default for Packet {
             packet_type: 0,
             complexity: 0,
             _padding: [0; 3],
+            target_node_idx: -1, // 宛先なし
+            speed: 3.0,          // デフォルト速度
         }
     }
 }
@@ -110,20 +135,22 @@ struct SpawnTask {
     y: f32,
     target_x: f32,
     target_y: f32,
-    total_count: usize,      // 生成する総数
-    spawned_count: usize,    // 生成済みの数
-    duration_ms: f64,        // 何ミリ秒かけて放出するか
+    target_node_idx: i32, // ターゲットノードのインデックス (-1 = 座標指定モード)
+    total_count: usize,   // 生成する総数
+    spawned_count: usize, // 生成済みの数
+    duration_ms: f64,     // 何ミリ秒かけて放出するか
     base_speed: f32,
     speed_variance: f32,
     packet_type: u32,
     complexity: u8,
-    start_time: f64,         // タスク開始時刻（performance.now()）
+    start_time: f64, // タスク開始時刻（performance.now()）
 }
 
 /// シミュレーション状態を管理する構造体
 #[wasm_bindgen]
 pub struct SimulationState {
     packets: Vec<Packet>,
+    nodes: Vec<Node>, // ノード（目的地）のリスト
     max_packets: usize,
     spawn_queue: Vec<SpawnTask>,
     current_time: f64,
@@ -142,13 +169,39 @@ impl SimulationState {
         ));
         SimulationState {
             packets,
+            nodes: Vec::new(), // ノードリスト初期化
             max_packets,
             spawn_queue: Vec::new(),
             current_time: 0.0,
         }
     }
 
-    /// パケット生成予約を追加
+    /// ノードを追加（JSから呼び出し）
+    pub fn add_node(&mut self, id: u32, x: f32, y: f32, node_type: u32) {
+        self.nodes.push(Node {
+            x,
+            y,
+            id,
+            node_type,
+        });
+        log(&format!(
+            "[Rust/Wasm] Node added: id={}, pos=({}, {}), type={}",
+            id, x, y, node_type
+        ));
+    }
+
+    /// すべてのノードをクリア
+    pub fn clear_nodes(&mut self) {
+        self.nodes.clear();
+        log("[Rust/Wasm] All nodes cleared");
+    }
+
+    /// ノード数を取得
+    pub fn get_node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// パケット生成予約を追加（座標指定モード）
     /// Goから送られてくる生成情報を受け取り、spawn_queueに追加する
     pub fn spawn_wave(
         &mut self,
@@ -168,6 +221,7 @@ impl SimulationState {
             y,
             target_x,
             target_y,
+            target_node_idx: -1, // 座標指定モード
             total_count: count,
             spawned_count: 0,
             duration_ms,
@@ -177,12 +231,50 @@ impl SimulationState {
             complexity,
             start_time: self.current_time,
         };
-        
+
         log(&format!(
             "[Rust/Wasm] spawn_wave: {} packets from ({}, {}) to ({}, {}), duration={}ms, speed={} ± {}",
             count, x, y, target_x, target_y, duration_ms, base_speed, speed_variance
         ));
-        
+
+        self.spawn_queue.push(task);
+    }
+
+    /// パケット生成予約を追加（ノード指定モード）
+    /// パケットは指定されたノードに向かって移動する
+    pub fn spawn_wave_to_node(
+        &mut self,
+        x: f32,
+        y: f32,
+        target_node_idx: i32,
+        count: usize,
+        duration_ms: f64,
+        base_speed: f32,
+        speed_variance: f32,
+        packet_type: u32,
+        complexity: u8,
+    ) {
+        let task = SpawnTask {
+            x,
+            y,
+            target_x: 0.0, // 使用しない
+            target_y: 0.0, // 使用しない
+            target_node_idx,
+            total_count: count,
+            spawned_count: 0,
+            duration_ms,
+            base_speed,
+            speed_variance,
+            packet_type,
+            complexity,
+            start_time: self.current_time,
+        };
+
+        log(&format!(
+            "[Rust/Wasm] spawn_wave_to_node: {} packets from ({}, {}) to node[{}], duration={}ms, speed={} ± {}",
+            count, x, y, target_node_idx, duration_ms, base_speed, speed_variance
+        ));
+
         self.spawn_queue.push(task);
     }
 
@@ -217,10 +309,10 @@ impl SimulationState {
     /// delta_ms: 前フレームからの経過時間（ミリ秒）
     pub fn tick(&mut self, delta_ms: f64) {
         self.current_time += delta_ms;
-        
+
         // 1. spawn_queueを処理: 予約に基づいてパケットを生成
         self.process_spawn_queue();
-        
+
         // 2. アクティブなパケットを更新
         self.update_packets(delta_ms);
     }
@@ -246,13 +338,13 @@ impl SimulationState {
     /// spawn_queueを処理し、適切な数のパケットを生成
     fn process_spawn_queue(&mut self) {
         let current_time = self.current_time;
-        
+
         // 完了したタスクを追跡
         let mut completed_indices = Vec::new();
-        
+
         for (idx, task) in self.spawn_queue.iter_mut().enumerate() {
             let elapsed = current_time - task.start_time;
-            
+
             // このフレームで生成すべき数を計算
             let target_spawned = if task.duration_ms <= 0.0 {
                 // duration_ms が 0 なら即時全生成
@@ -262,20 +354,10 @@ impl SimulationState {
                 let progress = (elapsed / task.duration_ms).min(1.0);
                 (task.total_count as f64 * progress) as usize
             };
-            
+
             let to_spawn = target_spawned.saturating_sub(task.spawned_count);
-            
+
             if to_spawn > 0 {
-                // 方向ベクトルを計算（正規化）
-                let dx = task.target_x - task.x;
-                let dy = task.target_y - task.y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let (dir_x, dir_y) = if dist > 0.0 {
-                    (dx / dist, dy / dist)
-                } else {
-                    (1.0, 0.0) // targetが同じ位置なら右向き
-                };
-                
                 let mut actually_spawned = 0;
                 for packet in self.packets.iter_mut() {
                     if packet.active == 0 && actually_spawned < to_spawn {
@@ -283,28 +365,50 @@ impl SimulationState {
                         packet.active = 1;
                         packet.x = task.x;
                         packet.y = task.y;
-                        
+
                         // 速度にばらつきを加える
-                        let speed = task.base_speed + (js_random() - 0.5) * 2.0 * task.speed_variance;
-                        packet.velocity_x = dir_x * speed;
-                        packet.velocity_y = dir_y * speed;
-                        
+                        let speed =
+                            task.base_speed + (js_random() - 0.5) * 2.0 * task.speed_variance;
+                        packet.speed = speed;
+
+                        // ノード指定モードかチェック
+                        if task.target_node_idx >= 0 {
+                            // ノードターゲットモード: パケットにターゲットノードを設定
+                            packet.target_node_idx = task.target_node_idx;
+                            // velocity は使わない（update_packetsでベクトル計算）
+                            packet.velocity_x = 0.0;
+                            packet.velocity_y = 0.0;
+                        } else {
+                            // 座標指定モード（従来の動作）
+                            packet.target_node_idx = -1;
+                            let dx = task.target_x - task.x;
+                            let dy = task.target_y - task.y;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            let (dir_x, dir_y) = if dist > 0.0 {
+                                (dx / dist, dy / dist)
+                            } else {
+                                (1.0, 0.0)
+                            };
+                            packet.velocity_x = dir_x * speed;
+                            packet.velocity_y = dir_y * speed;
+                        }
+
                         packet.packet_type = task.packet_type;
                         packet.complexity = task.complexity;
-                        
+
                         actually_spawned += 1;
                     }
                 }
-                
+
                 task.spawned_count += actually_spawned;
             }
-            
+
             // タスク完了チェック
             if task.spawned_count >= task.total_count {
                 completed_indices.push(idx);
             }
         }
-        
+
         // 完了したタスクを削除（逆順で削除してインデックスがずれないように）
         for idx in completed_indices.into_iter().rev() {
             self.spawn_queue.remove(idx);
@@ -312,20 +416,49 @@ impl SimulationState {
     }
 
     /// アクティブなパケットの位置を更新
-    fn update_packets(&mut self, delta_ms: f64) {
-        // delta_msを秒に変換してスケーリング
-        let dt = delta_ms / 16.67; // 60FPS基準でスケーリング
-        
+    fn update_packets(&mut self, _delta_ms: f64) {
+        let nodes = &self.nodes;
+
         for packet in self.packets.iter_mut() {
             if packet.active == 1 {
-                // 位置を更新
-                packet.x += packet.velocity_x * dt as f32;
-                packet.y += packet.velocity_y * dt as f32;
-                
-                // 画面外に出たら非アクティブに
-                if packet.x < -50.0 || packet.x > WIDTH + 50.0
-                    || packet.y < -50.0 || packet.y > HEIGHT + 50.0
-                {
+                // ノードターゲットモード
+                if packet.target_node_idx >= 0 && (packet.target_node_idx as usize) < nodes.len() {
+                    let target = &nodes[packet.target_node_idx as usize];
+
+                    // ベクトル計算（目的地 - 現在地）
+                    let dx = target.x - packet.x;
+                    let dy = target.y - packet.y;
+
+                    // 距離計算
+                    let dist_sq = dx * dx + dy * dy;
+                    let dist = dist_sq.sqrt();
+
+                    // 到達判定（半径5.0以内なら到着）
+                    if dist < 5.0 {
+                        // 到達！パケットを非アクティブに
+                        packet.active = 0;
+                    } else {
+                        // 正規化して速度を掛けて移動
+                        if dist > 0.0 {
+                            packet.x += (dx / dist) * packet.speed;
+                            packet.y += (dy / dist) * packet.speed;
+                        }
+                    }
+                } else if packet.target_node_idx == -1 {
+                    // 座標指定モード（従来のvelocity使用）
+                    packet.x += packet.velocity_x;
+                    packet.y += packet.velocity_y;
+
+                    // 画面外に出たら非アクティブに
+                    if packet.x < -50.0
+                        || packet.x > WIDTH + 50.0
+                        || packet.y < -50.0
+                        || packet.y > HEIGHT + 50.0
+                    {
+                        packet.active = 0;
+                    }
+                } else {
+                    // ターゲットがないか無効ならその場で消滅
                     packet.active = 0;
                 }
             }
@@ -989,7 +1122,7 @@ pub fn create_simulation(max_packets: usize) {
     ));
 }
 
-/// シミュレーションにパケット生成予約を追加
+/// シミュレーションにパケット生成予約を追加（座標指定モード）
 #[wasm_bindgen]
 pub fn simulation_spawn_wave(
     x: f32,
@@ -1021,6 +1154,74 @@ pub fn simulation_spawn_wave(
             log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
         }
     });
+}
+
+/// シミュレーションにパケット生成予約を追加（ノード指定モード）
+#[wasm_bindgen]
+pub fn simulation_spawn_wave_to_node(
+    x: f32,
+    y: f32,
+    target_node_idx: i32,
+    count: usize,
+    duration_ms: f64,
+    base_speed: f32,
+    speed_variance: f32,
+    packet_type: u32,
+    complexity: u8,
+) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.spawn_wave_to_node(
+                x,
+                y,
+                target_node_idx,
+                count,
+                duration_ms,
+                base_speed,
+                speed_variance,
+                packet_type,
+                complexity,
+            );
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
+}
+
+/// ノードを追加
+#[wasm_bindgen]
+pub fn simulation_add_node(id: u32, x: f32, y: f32, node_type: u32) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.add_node(id, x, y, node_type);
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
+}
+
+/// すべてのノードをクリア
+#[wasm_bindgen]
+pub fn simulation_clear_nodes() {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.clear_nodes();
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
+}
+
+/// ノード数を取得
+#[wasm_bindgen]
+pub fn simulation_get_node_count() -> usize {
+    SIMULATION_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|sim| sim.get_node_count())
+            .unwrap_or(0)
+    })
 }
 
 /// テスト用: 指定位置からパケットを生成
@@ -1075,7 +1276,7 @@ pub fn render_simulation_frame() {
             let mut renderer_opt = renderer_ref.borrow_mut();
             if let Some(renderer) = renderer_opt.as_mut() {
                 renderer.packet_count = 0;
-                
+
                 let surface_texture = match renderer.surface.get_current_texture() {
                     Ok(texture) => texture,
                     Err(_) => return,

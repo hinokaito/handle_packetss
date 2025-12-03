@@ -30,9 +30,23 @@ export interface WasmModule {
     packetType: number,
     complexity: number
   ) => void;
+  simulation_spawn_wave_to_node: (
+    x: number,
+    y: number,
+    targetNodeIdx: number,
+    count: number,
+    durationMs: number,
+    baseSpeed: number,
+    speedVariance: number,
+    packetType: number,
+    complexity: number
+  ) => void;
   simulation_debug_spawn: (x: number, y: number, count: number) => void;
   simulation_tick: (deltaMs: number) => void;
   simulation_get_active_count: () => number;
+  simulation_add_node: (id: number, x: number, y: number, nodeType: number) => void;
+  simulation_clear_nodes: () => void;
+  simulation_get_node_count: () => number;
   render_simulation_frame: () => void;
 }
 
@@ -79,9 +93,13 @@ export function useWasm(): UseWasmReturn {
           // Simulation API
           create_simulation: wasmModule.create_simulation,
           simulation_spawn_wave: wasmModule.simulation_spawn_wave,
+          simulation_spawn_wave_to_node: wasmModule.simulation_spawn_wave_to_node,
           simulation_debug_spawn: wasmModule.simulation_debug_spawn,
           simulation_tick: wasmModule.simulation_tick,
           simulation_get_active_count: wasmModule.simulation_get_active_count,
+          simulation_add_node: wasmModule.simulation_add_node,
+          simulation_clear_nodes: wasmModule.simulation_clear_nodes,
+          simulation_get_node_count: wasmModule.simulation_get_node_count,
           render_simulation_frame: wasmModule.render_simulation_frame,
         };
 
