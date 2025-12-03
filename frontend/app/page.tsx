@@ -63,7 +63,32 @@ export default function Home() {
     }
   }, [wasm, addLog]);
 
-  // Test: spawn packets from center
+  // ノード配置（GPU初期化後に一度だけ）
+  useEffect(() => {
+    if (wasm && isGpuReady) {
+      // ノードをクリアしてから配置
+      wasm.simulation_clear_nodes();
+      
+      // ノードタイプ: 0=Gateway, 1=LB, 2=Server, 3=DB
+      // Gateway（パケットの入口） - 画面左
+      wasm.simulation_add_node(0, 50, 300, 0);
+      
+      // LB（ロードバランサー） - 画面中央左
+      wasm.simulation_add_node(1, 250, 300, 1);
+      
+      // Servers（アプリサーバー） - 画面中央右
+      wasm.simulation_add_node(2, 500, 150, 2);
+      wasm.simulation_add_node(3, 500, 300, 2);
+      wasm.simulation_add_node(4, 500, 450, 2);
+      
+      // DB（データベース） - 画面右
+      wasm.simulation_add_node(5, 700, 300, 3);
+      
+      addLog('JS', `Nodes configured: ${wasm.simulation_get_node_count()} nodes`);
+    }
+  }, [wasm, isGpuReady, addLog]);
+
+  // Test: spawn packets from center (random direction)
   const handleDebugSpawn = useCallback(() => {
     if (wasm && isGpuReady) {
       wasm.simulation_debug_spawn(400, 300, 100);
@@ -72,22 +97,80 @@ export default function Home() {
     }
   }, [wasm, isGpuReady, addLog]);
 
-  // Test: spawn wave toward target
-  const handleSpawnWave = useCallback(() => {
+  // Test: spawn wave toward LB node
+  const handleSpawnToLB = useCallback(() => {
     if (wasm && isGpuReady) {
-      // Spawn 500 packets from left side toward center over 2 seconds
-      wasm.simulation_spawn_wave(
-        -50, 300,    // source position (off-screen left)
-        400, 300,    // target position (center)
-        500,         // count
-        2000,        // duration_ms
-        5.0,         // base_speed
-        1.5,         // speed_variance
+      // 左端からLBノード（インデックス1）に向かってパケットを生成
+      wasm.simulation_spawn_wave_to_node(
+        -20, 300,    // source position (off-screen left)
+        1,           // target_node_idx (LB)
+        100,         // count
+        1000,        // duration_ms
+        4.0,         // base_speed
+        1.0,         // speed_variance
         0,           // packet_type (Normal)
         10           // complexity
       );
       setIsSimulationRunning(true);
-      addLog('JS', 'spawn_wave: 500 packets over 2s');
+      addLog('JS', 'spawn_wave: 100 packets → LB node');
+    }
+  }, [wasm, isGpuReady, addLog]);
+
+  // Test: spawn wave toward Server nodes
+  const handleSpawnToServers = useCallback(() => {
+    if (wasm && isGpuReady) {
+      // LB位置から各サーバーにパケットを分散
+      // Server 1 (上)
+      wasm.simulation_spawn_wave_to_node(250, 300, 2, 50, 500, 5.0, 1.5, 0, 10);
+      // Server 2 (中央)
+      wasm.simulation_spawn_wave_to_node(250, 300, 3, 50, 500, 5.0, 1.5, 0, 10);
+      // Server 3 (下)
+      wasm.simulation_spawn_wave_to_node(250, 300, 4, 50, 500, 5.0, 1.5, 0, 10);
+      
+      setIsSimulationRunning(true);
+      addLog('JS', 'spawn_wave: 150 packets → Servers');
+    }
+  }, [wasm, isGpuReady, addLog]);
+
+  // Test: spawn wave toward DB
+  const handleSpawnToDB = useCallback(() => {
+    if (wasm && isGpuReady) {
+      // 各サーバーからDBにパケットを送信
+      wasm.simulation_spawn_wave_to_node(500, 150, 5, 30, 300, 4.5, 1.0, 0, 10);
+      wasm.simulation_spawn_wave_to_node(500, 300, 5, 30, 300, 4.5, 1.0, 0, 10);
+      wasm.simulation_spawn_wave_to_node(500, 450, 5, 30, 300, 4.5, 1.0, 0, 10);
+      
+      setIsSimulationRunning(true);
+      addLog('JS', 'spawn_wave: 90 packets → DB');
+    }
+  }, [wasm, isGpuReady, addLog]);
+
+  // Full flow demo: Gateway → LB → Servers → DB
+  const handleFullFlow = useCallback(() => {
+    if (wasm && isGpuReady) {
+      // Step 1: Gateway → LB
+      wasm.simulation_spawn_wave_to_node(-20, 300, 1, 200, 2000, 4.0, 1.0, 0, 10);
+      
+      // Step 2: LB → Servers（少し遅延を持たせて）
+      setTimeout(() => {
+        if (wasm) {
+          wasm.simulation_spawn_wave_to_node(250, 300, 2, 70, 1500, 5.0, 1.5, 0, 10);
+          wasm.simulation_spawn_wave_to_node(250, 300, 3, 70, 1500, 5.0, 1.5, 0, 10);
+          wasm.simulation_spawn_wave_to_node(250, 300, 4, 60, 1500, 5.0, 1.5, 0, 10);
+        }
+      }, 800);
+      
+      // Step 3: Servers → DB
+      setTimeout(() => {
+        if (wasm) {
+          wasm.simulation_spawn_wave_to_node(500, 150, 5, 50, 1000, 4.5, 1.0, 0, 10);
+          wasm.simulation_spawn_wave_to_node(500, 300, 5, 50, 1000, 4.5, 1.0, 0, 10);
+          wasm.simulation_spawn_wave_to_node(500, 450, 5, 50, 1000, 4.5, 1.0, 0, 10);
+        }
+      }, 1800);
+      
+      setIsSimulationRunning(true);
+      addLog('JS', 'Full flow: Gateway → LB → Servers → DB');
     }
   }, [wasm, isGpuReady, addLog]);
 
@@ -147,16 +230,34 @@ export default function Home() {
         {isGpuReady && (
           <div className="flex gap-2 flex-wrap">
             <button
-              onClick={handleDebugSpawn}
-              className="px-4 py-2 bg-[#238636] hover:bg-[#2ea043] rounded-lg text-white font-semibold transition-colors"
-            >
-              🎯 Debug Spawn (100)
-            </button>
-            <button
-              onClick={handleSpawnWave}
+              onClick={handleSpawnToLB}
               className="px-4 py-2 bg-[#1f6feb] hover:bg-[#388bfd] rounded-lg text-white font-semibold transition-colors"
             >
-              🌊 Spawn Wave (500)
+              📡 → LB
+            </button>
+            <button
+              onClick={handleSpawnToServers}
+              className="px-4 py-2 bg-[#238636] hover:bg-[#2ea043] rounded-lg text-white font-semibold transition-colors"
+            >
+              🖥️ → Servers
+            </button>
+            <button
+              onClick={handleSpawnToDB}
+              className="px-4 py-2 bg-[#8957e5] hover:bg-[#a371f7] rounded-lg text-white font-semibold transition-colors"
+            >
+              💾 → DB
+            </button>
+            <button
+              onClick={handleFullFlow}
+              className="px-4 py-2 bg-[#f0883e] hover:bg-[#d29922] rounded-lg text-white font-semibold transition-colors"
+            >
+              🔄 Full Flow
+            </button>
+            <button
+              onClick={handleDebugSpawn}
+              className="px-4 py-2 bg-[#484f58] hover:bg-[#6e7681] rounded-lg text-white font-semibold transition-colors"
+            >
+              🎯 Random
             </button>
             {isSimulationRunning && (
               <button
