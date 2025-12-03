@@ -17,3 +17,13 @@ Cargo.lock
 
 *.exe
 ja/
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.env*.local
+frontend/node_modules/
+frontend/.vercel
+frontend/.swc/
+frontend/dist/

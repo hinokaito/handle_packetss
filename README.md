@@ -27,8 +27,8 @@ go run main.go
 
 ### frontend
 ```bash
-cd web
-python -m http.server 8080
+cd frontend
+npm run dev
 ```
 
 
