@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useWasm } from '@/hooks/useWasm';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { PacketCanvas } from '@/components/PacketCanvas';
@@ -8,6 +8,7 @@ import { StatusIndicator } from '@/components/StatusIndicator';
 import { StatsDisplay } from '@/components/StatsDisplay';
 import { LogContainer } from '@/components/LogContainer';
 import { Controls } from '@/components/Controls';
+import { type NodeData, WASM_NODE_POSITIONS } from '@/components/NodeOverlay';
 
 export default function Home() {
   const { isLoaded, isGpuReady, error, wasm, initGpu } = useWasm();
@@ -24,6 +25,21 @@ export default function Home() {
   const [activePacketCount, setActivePacketCount] = useState(0);
   const lastTimeRef = useRef<number>(0);
   const animationFrameRef = useRef<number | null>(null);
+
+  // デバッグ用
+  const [showDebugGrid, setShowDebugGrid] = useState(false);
+  const [lbOffsetX, setLbOffsetX] = useState(0);
+  const [lbOffsetY, setLbOffsetY] = useState(0);
+
+  // ノード定義（Wasm座標 + デバッグオフセット）
+  const nodes: NodeData[] = useMemo(() => [
+    { id: 0, x: WASM_NODE_POSITIONS.gateway.x, y: WASM_NODE_POSITIONS.gateway.y, type: 'gateway', label: 'Gateway' },
+    { id: 1, x: WASM_NODE_POSITIONS.lb.x + lbOffsetX, y: WASM_NODE_POSITIONS.lb.y + lbOffsetY, type: 'lb', label: 'LB' },
+    { id: 2, x: WASM_NODE_POSITIONS.servers[0].x, y: WASM_NODE_POSITIONS.servers[0].y, type: 'server', label: 'Server 1' },
+    { id: 3, x: WASM_NODE_POSITIONS.servers[1].x, y: WASM_NODE_POSITIONS.servers[1].y, type: 'server', label: 'Server 2' },
+    { id: 4, x: WASM_NODE_POSITIONS.servers[2].x, y: WASM_NODE_POSITIONS.servers[2].y, type: 'server', label: 'Server 3' },
+    { id: 5, x: WASM_NODE_POSITIONS.db.x, y: WASM_NODE_POSITIONS.db.y, type: 'db', label: 'DB' },
+  ], [lbOffsetX, lbOffsetY]);
 
   // Simulation animation loop
   useEffect(() => {
@@ -73,7 +89,7 @@ export default function Home() {
       // Gateway（パケットの入口） - 画面左端
       wasm.simulation_add_node(0, 150, 540, 0);
       
-      // LB（ロードバランサー） - 画面左寄り
+      // LB（ロードバランサー） - 画面左寄り（初期位置）
       wasm.simulation_add_node(1, 550, 540, 1);
       
       // Servers（アプリサーバー） - 画面中央
@@ -87,6 +103,15 @@ export default function Home() {
       addLog('JS', `Nodes configured: ${wasm.simulation_get_node_count()} nodes`);
     }
   }, [wasm, isGpuReady, addLog]);
+
+  // LB位置のスライダー変更時にWASM側のノード位置も更新
+  useEffect(() => {
+    if (wasm && isGpuReady) {
+      const newX = WASM_NODE_POSITIONS.lb.x + lbOffsetX;
+      const newY = WASM_NODE_POSITIONS.lb.y + lbOffsetY;
+      wasm.simulation_update_node_position(1, newX, newY);
+    }
+  }, [wasm, isGpuReady, lbOffsetX, lbOffsetY]);
 
   // Test: spawn packets from center (random direction)
   const handleDebugSpawn = useCallback(() => {
@@ -232,6 +257,10 @@ export default function Home() {
             isGpuReady={isGpuReady}
             onGpuInit={initGpu}
             onLog={addLog}
+            nodes={nodes}
+            showDebugGrid={showDebugGrid}
+            lbOffsetX={lbOffsetX}
+            lbOffsetY={lbOffsetY}
           />
         )}
 
@@ -244,6 +273,57 @@ export default function Home() {
             <div className="text-[#8b949e] text-sm">
               Simulation: {isSimulationRunning ? '▶️ Running' : '⏸️ Stopped'} | 
               Active Packets: <span className="text-[#58a6ff] font-mono">{activePacketCount}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Debug: LB Offset Adjustment */}
+        {isGpuReady && (
+          <div className="px-4 py-3 bg-[#161b22] rounded-lg border border-[#30363d] space-y-3">
+            <div className="flex items-center gap-4">
+              <span className="text-[#f0883e] text-sm font-semibold">🔧 Debug</span>
+              <button
+                onClick={() => setShowDebugGrid(!showDebugGrid)}
+                className={`px-3 py-1 rounded text-sm ${showDebugGrid ? 'bg-[#f0883e] text-white' : 'bg-[#30363d] text-[#8b949e] hover:bg-[#484f58]'}`}
+              >
+                {showDebugGrid ? '📐 Grid ON' : '📐 Grid OFF'}
+              </button>
+            </div>
+            <div className="text-[#6e7681] text-xs">
+              LBアイコンのオフセット調整（Wasm位置: {WASM_NODE_POSITIONS.lb.x}, {WASM_NODE_POSITIONS.lb.y}）
+            </div>
+            <div className="flex items-center gap-4">
+              <label className="text-[#8b949e] text-sm w-32">X Offset: {lbOffsetX}</label>
+              <input
+                type="range"
+                min="-500"
+                max="500"
+                value={lbOffsetX}
+                onChange={(e) => setLbOffsetX(Number(e.target.value))}
+                className="flex-1 h-2 bg-[#30363d] rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+            <div className="flex items-center gap-4">
+              <label className="text-[#8b949e] text-sm w-32">Y Offset: {lbOffsetY}</label>
+              <input
+                type="range"
+                min="-500"
+                max="500"
+                value={lbOffsetY}
+                onChange={(e) => setLbOffsetY(Number(e.target.value))}
+                className="flex-1 h-2 bg-[#30363d] rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setLbOffsetX(0); setLbOffsetY(0); }}
+                className="px-3 py-1 bg-[#30363d] hover:bg-[#484f58] rounded text-[#8b949e] text-sm"
+              >
+                Reset Offset (0, 0)
+              </button>
+              <span className="text-[#58a6ff] text-xs self-center">
+                現在のLB位置: ({WASM_NODE_POSITIONS.lb.x + lbOffsetX}, {WASM_NODE_POSITIONS.lb.y + lbOffsetY})
+              </span>
             </div>
           </div>
         )}

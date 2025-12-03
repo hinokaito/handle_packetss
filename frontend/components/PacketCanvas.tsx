@@ -2,19 +2,24 @@
 
 import { useEffect, useRef } from 'react';
 import type { WasmModule } from '@/hooks/useWasm';
+import { NodeOverlay, type NodeData } from './NodeOverlay';
 
 interface PacketCanvasProps {
   wasm: WasmModule | null;
   isGpuReady: boolean;
   onGpuInit: (canvasId: string) => Promise<void>;
   onLog?: (source: 'JS' | 'Rust' | 'WS', message: string) => void;
+  nodes?: NodeData[];
+  showDebugGrid?: boolean;
+  lbOffsetX?: number;
+  lbOffsetY?: number;
 }
 
 const CANVAS_ID = 'packetCanvas';
-const CANVAS_WIDTH = 1920;
-const CANVAS_HEIGHT = 1080;
+export const CANVAS_WIDTH = 1920;
+export const CANVAS_HEIGHT = 1080;
 
-export function PacketCanvas({ wasm, isGpuReady, onGpuInit, onLog }: PacketCanvasProps) {
+export function PacketCanvas({ wasm, isGpuReady, onGpuInit, onLog, nodes = [], showDebugGrid = false, lbOffsetX = 0, lbOffsetY = 0 }: PacketCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const initializedRef = useRef(false);
 
@@ -43,18 +48,28 @@ export function PacketCanvas({ wasm, isGpuReady, onGpuInit, onLog }: PacketCanva
   return (
     <div className="flex justify-center">
       <div 
-        className="rounded-lg border border-[#30363d] overflow-hidden bg-[#0d1117]"
+        className="relative rounded-lg border border-[#30363d] overflow-hidden bg-[#0d1117]"
         style={{ 
           width: 'min(70vw, 90vh * 16 / 9)',  // 幅は70vwか、高さベースの16:9のどちらか小さい方
           aspectRatio: '16 / 9'               // アスペクト比を固定
         }}
       >
+        {/* WebGPU Canvas (パケット描画) */}
         <canvas
           ref={canvasRef}
           id={CANVAS_ID}
           width={CANVAS_WIDTH}
           height={CANVAS_HEIGHT}
           className="block w-full h-full"
+        />
+        {/* Node Overlay (ノード描画 - パケットより前面) */}
+        <NodeOverlay 
+          nodes={nodes} 
+          width={CANVAS_WIDTH} 
+          height={CANVAS_HEIGHT}
+          showDebugGrid={showDebugGrid}
+          lbOffsetX={lbOffsetX}
+          lbOffsetY={lbOffsetY}
         />
       </div>
     </div>
