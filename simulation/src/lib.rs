@@ -54,8 +54,8 @@ thread_local! {
     static SIMULATION_STATE: RefCell<Option<SimulationState>> = RefCell::new(None);
 }
 
-const WIDTH: f32 = 800.0;
-const HEIGHT: f32 = 600.0;
+const WIDTH: f32 = 1920.0;
+const HEIGHT: f32 = 1080.0;
 
 // =============================================================================
 // SIMULATION ENGINE - パケット生成・シミュレーション
@@ -417,13 +417,17 @@ impl SimulationState {
 
     /// アクティブなパケットの位置を更新
     fn update_packets(&mut self, _delta_ms: f64) {
-        let nodes = &self.nodes;
+        // 到達したパケットのインデックスを収集
+        let mut arrived_packets: Vec<usize> = Vec::new();
 
-        for packet in self.packets.iter_mut() {
+        // まずパケットの移動処理（不変借用でノードを参照）
+        for (idx, packet) in self.packets.iter_mut().enumerate() {
             if packet.active == 1 {
                 // ノードターゲットモード
-                if packet.target_node_idx >= 0 && (packet.target_node_idx as usize) < nodes.len() {
-                    let target = &nodes[packet.target_node_idx as usize];
+                if packet.target_node_idx >= 0
+                    && (packet.target_node_idx as usize) < self.nodes.len()
+                {
+                    let target = &self.nodes[packet.target_node_idx as usize];
 
                     // ベクトル計算（目的地 - 現在地）
                     let dx = target.x - packet.x;
@@ -435,8 +439,8 @@ impl SimulationState {
 
                     // 到達判定（半径5.0以内なら到着）
                     if dist < 5.0 {
-                        // 到達！パケットを非アクティブに
-                        packet.active = 0;
+                        // 到達！→ 後で処理
+                        arrived_packets.push(idx);
                     } else {
                         // 正規化して速度を掛けて移動
                         if dist > 0.0 {
@@ -462,6 +466,113 @@ impl SimulationState {
                     packet.active = 0;
                 }
             }
+        }
+
+        // 到達したパケットの処理（ルーティング）
+        for packet_idx in arrived_packets {
+            self.handle_packet_arrival(packet_idx);
+        }
+    }
+
+    /// パケットがターゲットノードに到達したときの処理
+    fn handle_packet_arrival(&mut self, packet_idx: usize) {
+        // Rustの借用ルール回避のため、必要な情報をコピーして取得
+        let (target_node_idx, _packet_type) = {
+            let p = &self.packets[packet_idx];
+            (p.target_node_idx, p.packet_type)
+        };
+
+        // ターゲットが存在しないなら終了
+        if target_node_idx < 0 {
+            self.packets[packet_idx].active = 0;
+            return;
+        }
+
+        // 到達したノードの情報を取得
+        let node_type = self.nodes[target_node_idx as usize].node_type;
+        let current_node_pos = (
+            self.nodes[target_node_idx as usize].x,
+            self.nodes[target_node_idx as usize].y,
+        );
+
+        match node_type {
+            0 => {
+                // Type 0: Gateway (入口)
+                // Gateway -> LBへルーティング
+                if let Some(next_idx) = self.find_next_node_by_type(1) {
+                    let p = &mut self.packets[packet_idx];
+                    p.target_node_idx = next_idx as i32;
+                    p.x = current_node_pos.0;
+                    p.y = current_node_pos.1;
+                } else {
+                    self.packets[packet_idx].active = 0;
+                }
+            }
+            1 => {
+                // Type 1: Load Balancer (LB)
+                // LB -> Serverへルーティング（ラウンドロビン的に分散）
+                if let Some(next_idx) = self.find_next_server_target() {
+                    let p = &mut self.packets[packet_idx];
+                    p.target_node_idx = next_idx as i32;
+                    p.x = current_node_pos.0;
+                    p.y = current_node_pos.1;
+                } else {
+                    self.packets[packet_idx].active = 0;
+                }
+            }
+            2 => {
+                // Type 2: Server
+                // Server -> DBへルーティング
+                if let Some(next_idx) = self.find_next_node_by_type(3) {
+                    let p = &mut self.packets[packet_idx];
+                    p.target_node_idx = next_idx as i32;
+                    p.x = current_node_pos.0;
+                    p.y = current_node_pos.1;
+                } else {
+                    // DBがない場合は処理完了
+                    self.packets[packet_idx].active = 0;
+                }
+            }
+            3 => {
+                // Type 3: DB
+                // DB到達 = リクエスト処理完了
+                self.packets[packet_idx].active = 0;
+            }
+            _ => {
+                // その他
+                self.packets[packet_idx].active = 0;
+            }
+        }
+    }
+
+    /// 指定タイプのノードを検索して返す
+    fn find_next_node_by_type(&self, node_type: u32) -> Option<usize> {
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.node_type == node_type {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// ロードバランシング: Serverノードをラウンドロビン的に選択
+    /// 複数のServerがある場合、ランダムに選択
+    fn find_next_server_target(&self) -> Option<usize> {
+        // node_type == 2 (Server) のノードを収集
+        let servers: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.node_type == 2)
+            .map(|(i, _)| i)
+            .collect();
+
+        if servers.is_empty() {
+            None
+        } else {
+            // ランダムに1つ選択
+            let random_idx = (js_random() * servers.len() as f32) as usize;
+            Some(servers[random_idx.min(servers.len() - 1)])
         }
     }
 
