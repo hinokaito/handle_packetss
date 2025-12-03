@@ -27,8 +27,8 @@ fn vs_main(
     let wave = sin(time_data.time * 5.0 + packet_pos.y * 0.05) * 10.0;
     let animated_pos = vec2<f32>(packet_pos.x + wave, packet_pos.y);
 
-    let canvas_width = 800.0;
-    let canvas_height = 600.0;
+    let canvas_width = 1920.0;
+    let canvas_height = 1080.0;
     let world_pos = animated_pos + pos;
     let x = (world_pos.x / canvas_width) * 2.0 - 1.0;
     let y = 1.0 - (world_pos.y / canvas_height) * 2.0;
