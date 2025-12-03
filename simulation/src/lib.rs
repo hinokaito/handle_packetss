@@ -201,6 +201,23 @@ impl SimulationState {
         self.nodes.len()
     }
 
+    /// ノードの位置を更新（JSから呼び出し）
+    pub fn update_node_position(&mut self, id: u32, x: f32, y: f32) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
+            node.x = x;
+            node.y = y;
+            log(&format!(
+                "[Rust/Wasm] Node position updated: id={}, pos=({}, {})",
+                id, x, y
+            ));
+        } else {
+            log(&format!(
+                "[Rust/Wasm] Warning: Node with id={} not found for position update",
+                id
+            ));
+        }
+    }
+
     /// パケット生成予約を追加（座標指定モード）
     /// Goから送られてくる生成情報を受け取り、spawn_queueに追加する
     pub fn spawn_wave(
@@ -1333,6 +1350,18 @@ pub fn simulation_get_node_count() -> usize {
             .map(|sim| sim.get_node_count())
             .unwrap_or(0)
     })
+}
+
+/// ノードの位置を更新
+#[wasm_bindgen]
+pub fn simulation_update_node_position(id: u32, x: f32, y: f32) {
+    SIMULATION_STATE.with(|state| {
+        if let Some(sim) = state.borrow_mut().as_mut() {
+            sim.update_node_position(id, x, y);
+        } else {
+            log("[Rust/Wasm] Error: Simulation not initialized. Call create_simulation first.");
+        }
+    });
 }
 
 /// テスト用: 指定位置からパケットを生成

@@ -47,6 +47,7 @@ export interface WasmModule {
   simulation_add_node: (id: number, x: number, y: number, nodeType: number) => void;
   simulation_clear_nodes: () => void;
   simulation_get_node_count: () => number;
+  simulation_update_node_position: (id: number, x: number, y: number) => void;
   render_simulation_frame: () => void;
 }
 
@@ -100,6 +101,7 @@ export function useWasm(): UseWasmReturn {
           simulation_add_node: wasmModule.simulation_add_node,
           simulation_clear_nodes: wasmModule.simulation_clear_nodes,
           simulation_get_node_count: wasmModule.simulation_get_node_count,
+          simulation_update_node_position: wasmModule.simulation_update_node_position,
           render_simulation_frame: wasmModule.render_simulation_frame,
         };
 
