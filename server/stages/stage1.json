@@ -7,12 +7,17 @@
   },
   "map": {
     "fixed_nodes": [
-      { "id": "gateway", "type": "gateway", "x": 150, "y": 540 }
+      { "id": "gateway", "type": "gateway", "x": 150, "y": 540 },
+      { "id": "lb", "type": "lb", "x": 500, "y": 540 },
+      { "id": "server1", "type": "server", "x": 900, "y": 300 },
+      { "id": "server2", "type": "server", "x": 900, "y": 540 },
+      { "id": "server3", "type": "server", "x": 900, "y": 780 },
+      { "id": "db", "type": "db", "x": 1300, "y": 540 }
     ]
   },
   "waves": [
     {
-      "time_start_ms": 1000,
+      "time_start_ms": 100,
       "source_id": "gateway",
       "count": 50,
       "duration_ms": 2000,
@@ -20,7 +25,7 @@
       "speed": 5.0
     },
     {
-      "time_start_ms": 5000,
+      "time_start_ms": 3000,
       "source_id": "gateway",
       "count": 200,
       "duration_ms": 1000,
@@ -29,4 +34,3 @@
     }
   ]
 }
-

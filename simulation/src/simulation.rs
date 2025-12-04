@@ -105,6 +105,16 @@ struct SpawnTask {
     start_time: f64, // タスク開始時刻（performance.now()）
 }
 
+/// シミュレーション統計
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimulationStats {
+    pub packets_spawned: u32,    // 生成されたパケット総数
+    pub packets_processed: u32,  // 正常に処理完了したパケット数（DB到達）
+    pub packets_dropped: u32,    // ドロップ/失敗したパケット数
+    pub packets_in_flight: u32,  // 現在処理中のパケット数
+}
+
 /// シミュレーション状態を管理する構造体
 #[wasm_bindgen]
 pub struct SimulationState {
@@ -113,6 +123,7 @@ pub struct SimulationState {
     max_packets: usize,
     spawn_queue: Vec<SpawnTask>,
     current_time: f64,
+    stats: SimulationStats, // 統計情報
 }
 
 #[wasm_bindgen]
@@ -132,6 +143,7 @@ impl SimulationState {
             max_packets,
             spawn_queue: Vec::new(),
             current_time: 0.0,
+            stats: SimulationStats::default(),
         }
     }
 
@@ -307,6 +319,66 @@ impl SimulationState {
     pub fn get_max_packets(&self) -> usize {
         self.max_packets
     }
+
+    /// 現在の経過時間を返す
+    pub fn get_current_time(&self) -> f64 {
+        self.current_time
+    }
+
+    /// 統計: 生成されたパケット総数
+    pub fn get_stats_spawned(&self) -> u32 {
+        self.stats.packets_spawned
+    }
+
+    /// 統計: 処理完了したパケット数
+    pub fn get_stats_processed(&self) -> u32 {
+        self.stats.packets_processed
+    }
+
+    /// 統計: ドロップしたパケット数
+    pub fn get_stats_dropped(&self) -> u32 {
+        self.stats.packets_dropped
+    }
+
+    /// 統計をリセット
+    pub fn reset_stats(&mut self) {
+        self.stats = SimulationStats::default();
+        log("[Rust/Wasm] Stats reset");
+    }
+
+    /// シミュレーション全体をリセット（パケット、統計、時間）
+    pub fn reset(&mut self) {
+        // すべてのパケットを非アクティブに
+        for packet in self.packets.iter_mut() {
+            packet.active = 0;
+        }
+        // スポーンキューをクリア
+        self.spawn_queue.clear();
+        // 時間をリセット
+        self.current_time = 0.0;
+        // 統計をリセット
+        self.stats = SimulationStats::default();
+        log("[Rust/Wasm] Simulation reset");
+    }
+
+}
+
+// SimulationStateの内部実装（#[wasm_bindgen]なし）- ノード位置取得
+impl SimulationState {
+    /// 指定IDのノード位置を取得（見つからない場合はNone）
+    pub fn get_node_position(&self, id: u32) -> Option<(f32, f32)> {
+        self.nodes.iter().find(|n| n.id == id).map(|n| (n.x, n.y))
+    }
+
+    /// インデックスでノード位置を取得
+    pub fn get_node_position_by_index(&self, index: usize) -> Option<(f32, f32)> {
+        self.nodes.get(index).map(|n| (n.x, n.y))
+    }
+
+    /// インデックスでノードタイプを取得
+    pub fn get_node_type_by_index(&self, index: usize) -> Option<u32> {
+        self.nodes.get(index).map(|n| n.node_type)
+    }
 }
 
 // SimulationStateの内部実装（#[wasm_bindgen]なし）
@@ -377,6 +449,7 @@ impl SimulationState {
                 }
 
                 task.spawned_count += actually_spawned;
+                self.stats.packets_spawned += actually_spawned as u32;
             }
 
             // タスク完了チェック
@@ -481,7 +554,9 @@ impl SimulationState {
                     p.x = current_node_pos.0;
                     p.y = current_node_pos.1;
                 } else {
+                    // LBがない = ドロップ
                     self.packets[packet_idx].active = 0;
+                    self.stats.packets_dropped += 1;
                 }
             }
             1 => {
@@ -493,7 +568,9 @@ impl SimulationState {
                     p.x = current_node_pos.0;
                     p.y = current_node_pos.1;
                 } else {
+                    // Serverがない = ドロップ
                     self.packets[packet_idx].active = 0;
+                    self.stats.packets_dropped += 1;
                 }
             }
             2 => {
@@ -505,18 +582,21 @@ impl SimulationState {
                     p.x = current_node_pos.0;
                     p.y = current_node_pos.1;
                 } else {
-                    // DBがない場合は処理完了
+                    // DBがない = ドロップ
                     self.packets[packet_idx].active = 0;
+                    self.stats.packets_dropped += 1;
                 }
             }
             3 => {
                 // Type 3: DB
-                // DB到達 = リクエスト処理完了
+                // DB到達 = リクエスト処理完了（成功）
                 self.packets[packet_idx].active = 0;
+                self.stats.packets_processed += 1;
             }
             _ => {
-                // その他
+                // その他（不明なノード = ドロップ扱い）
                 self.packets[packet_idx].active = 0;
+                self.stats.packets_dropped += 1;
             }
         }
     }
