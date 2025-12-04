@@ -196,20 +196,36 @@ pub async fn init_gpu_internal(canvas_id: &str) -> Result<(), JsValue> {
         source: ShaderSource::Wgsl(SHADER_SOURCE.into()),
     });
 
+    // 新しいバッファレイアウト: [x, y, r, g, b, size] = 6 floats per entity
     let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("Packet Render Pipeline"),
+        label: Some("Entity Render Pipeline"),
         layout: Some(&render_pipeline_layout),
         vertex: VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
             buffers: &[VertexBufferLayout {
-                array_stride: std::mem::size_of::<f32>() as u64 * 2,
+                array_stride: std::mem::size_of::<f32>() as u64 * 6, // x, y, r, g, b, size
                 step_mode: VertexStepMode::Instance,
-                attributes: &[VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: VertexFormat::Float32x2,
-                }],
+                attributes: &[
+                    // position (x, y)
+                    VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: VertexFormat::Float32x2,
+                    },
+                    // color (r, g, b)
+                    VertexAttribute {
+                        offset: std::mem::size_of::<f32>() as u64 * 2,
+                        shader_location: 1,
+                        format: VertexFormat::Float32x3,
+                    },
+                    // size
+                    VertexAttribute {
+                        offset: std::mem::size_of::<f32>() as u64 * 5,
+                        shader_location: 2,
+                        format: VertexFormat::Float32,
+                    },
+                ],
             }],
             compilation_options: PipelineCompilationOptions::default(),
         },
@@ -242,10 +258,11 @@ pub async fn init_gpu_internal(canvas_id: &str) -> Result<(), JsValue> {
         cache: None,
     });
 
-    let max_packets = 100_000;
+    // バッファサイズ: エンティティ数 * 6 floats (x, y, r, g, b, size)
+    let max_entities = 100_000;
     let packet_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Packet Buffer"),
-        size: (max_packets * 2 * std::mem::size_of::<f32>()) as u64,
+        label: Some("Entity Buffer"),
+        size: (max_entities * 6 * std::mem::size_of::<f32>()) as u64,
         usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -442,69 +459,17 @@ pub fn render_frame_internal() {
     });
 }
 
-// シミュレーション用の描画関数
-pub fn render_simulation_frame_internal(coords: &[f32]) {
-    if coords.is_empty() {
-        // パケットがない場合は画面クリアのみ
-        GPU_RENDERER.with(|renderer_ref| {
-            let mut renderer_opt = renderer_ref.borrow_mut();
-            if let Some(renderer) = renderer_opt.as_mut() {
-                renderer.packet_count = 0;
-
-                let surface_texture = match renderer.surface.get_current_texture() {
-                    Ok(texture) => texture,
-                    Err(_) => return,
-                };
-
-                let view = surface_texture
-                    .texture
-                    .create_view(&TextureViewDescriptor::default());
-
-                let mut encoder =
-                    renderer
-                        .device
-                        .create_command_encoder(&CommandEncoderDescriptor {
-                            label: Some("Clear Encoder"),
-                        });
-
-                {
-                    let _render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                        label: Some("Clear Pass"),
-                        color_attachments: &[Some(RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: Operations {
-                                load: LoadOp::Clear(BG_COLOR),
-                                store: StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                    });
-                }
-
-                renderer.queue.submit(Some(encoder.finish()));
-                surface_texture.present();
-            }
-        });
-        return;
-    }
-
-    // パケットがある場合は描画
+/// エンティティデータ形式: [x, y, r, g, b, size] の配列
+/// ノードとパケットを一緒に描画
+pub fn render_simulation_frame_internal(entity_data: &[f32]) {
     GPU_RENDERER.with(|renderer_ref| {
         let mut renderer_opt = renderer_ref.borrow_mut();
         if let Some(renderer) = renderer_opt.as_mut() {
-            let total_packets = coords.len() / 2;
-            let packet_count = total_packets.min(MAX_PACKETS);
-            let coords_to_render = &coords[0..(packet_count * 2)];
+            // エンティティ数を計算（6 floats per entity）
+            let entity_count = entity_data.len() / 6;
+            let entity_count = entity_count.min(MAX_PACKETS);
 
-            renderer.queue.write_buffer(
-                &renderer.packet_buffer,
-                0,
-                bytemuck::cast_slice(coords_to_render),
-            );
-
+            // タイムユニフォームを更新
             let current_time = (now() / 1000.0) as f32;
             let time_data = TimeUniform {
                 time: current_time,
@@ -516,6 +481,7 @@ pub fn render_simulation_frame_internal(coords: &[f32]) {
                 bytemuck::cast_slice(&[time_data]),
             );
 
+            // サーフェステクスチャを取得
             let surface_texture = match renderer.surface.get_current_texture() {
                 Ok(texture) => texture,
                 Err(_) => return,
@@ -524,6 +490,16 @@ pub fn render_simulation_frame_internal(coords: &[f32]) {
             let view = surface_texture
                 .texture
                 .create_view(&TextureViewDescriptor::default());
+
+            // エンティティがある場合はバッファに書き込み
+            if entity_count > 0 {
+                let data_to_render = &entity_data[0..(entity_count * 6)];
+                renderer.queue.write_buffer(
+                    &renderer.packet_buffer,
+                    0,
+                    bytemuck::cast_slice(data_to_render),
+                );
+            }
 
             {
                 let mut encoder =
@@ -549,18 +525,20 @@ pub fn render_simulation_frame_internal(coords: &[f32]) {
                         timestamp_writes: None,
                     });
 
-                    render_pass.set_pipeline(&renderer.render_pipeline);
-                    render_pass.set_bind_group(0, &renderer.time_bind_group, &[]);
-                    let buffer_size = (packet_count * 2 * std::mem::size_of::<f32>()) as u64;
-                    render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
-                    render_pass.draw(0..4, 0..packet_count as u32);
+                    if entity_count > 0 {
+                        render_pass.set_pipeline(&renderer.render_pipeline);
+                        render_pass.set_bind_group(0, &renderer.time_bind_group, &[]);
+                        let buffer_size = (entity_count * 6 * std::mem::size_of::<f32>()) as u64;
+                        render_pass.set_vertex_buffer(0, renderer.packet_buffer.slice(0..buffer_size));
+                        render_pass.draw(0..4, 0..entity_count as u32);
+                    }
                 }
 
                 renderer.queue.submit(Some(encoder.finish()));
             }
 
             surface_texture.present();
-            renderer.packet_count = packet_count as u32;
+            renderer.packet_count = entity_count as u32;
         }
     });
 }

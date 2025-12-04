@@ -49,6 +49,21 @@ export interface WasmModule {
   simulation_get_node_count: () => number;
   simulation_update_node_position: (id: number, x: number, y: number) => void;
   render_simulation_frame: () => void;
+  // Stage Config API
+  load_stage_config: (jsonStr: string) => boolean;
+  get_stage_meta: () => string | undefined;
+  get_stage_budget: () => number;
+  get_stage_sla_target: () => number;
+  trigger_waves_until: (currentTimeMs: number) => void;
+  get_pending_wave_count: () => number;
+  reset_stage_waves: () => void;
+  // Stats API
+  simulation_get_stats_spawned: () => number;
+  simulation_get_stats_processed: () => number;
+  simulation_get_stats_dropped: () => number;
+  simulation_get_current_time: () => number;
+  simulation_reset: () => void;
+  simulation_get_node_position: (index: number) => Float32Array;
 }
 
 export interface UseWasmReturn {
@@ -103,6 +118,21 @@ export function useWasm(): UseWasmReturn {
           simulation_get_node_count: wasmModule.simulation_get_node_count,
           simulation_update_node_position: wasmModule.simulation_update_node_position,
           render_simulation_frame: wasmModule.render_simulation_frame,
+          // Stage Config API
+          load_stage_config: wasmModule.load_stage_config,
+          get_stage_meta: wasmModule.get_stage_meta,
+          get_stage_budget: wasmModule.get_stage_budget,
+          get_stage_sla_target: wasmModule.get_stage_sla_target,
+          trigger_waves_until: wasmModule.trigger_waves_until,
+          get_pending_wave_count: wasmModule.get_pending_wave_count,
+          reset_stage_waves: wasmModule.reset_stage_waves,
+          // Stats API
+          simulation_get_stats_spawned: wasmModule.simulation_get_stats_spawned,
+          simulation_get_stats_processed: wasmModule.simulation_get_stats_processed,
+          simulation_get_stats_dropped: wasmModule.simulation_get_stats_dropped,
+          simulation_get_current_time: wasmModule.simulation_get_current_time,
+          simulation_reset: wasmModule.simulation_reset,
+          simulation_get_node_position: wasmModule.simulation_get_node_position,
         };
 
         // Pre-allocate packet buffer
