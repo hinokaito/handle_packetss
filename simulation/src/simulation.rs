@@ -564,4 +564,3 @@ impl SimulationState {
         coords
     }
 }
-

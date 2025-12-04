@@ -564,4 +564,3 @@ pub fn render_simulation_frame_internal(coords: &[f32]) {
         }
     });
 }
-
