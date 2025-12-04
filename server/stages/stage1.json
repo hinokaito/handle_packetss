@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "title": "Stage 1: First Access",
+    "description": "予算$500以内で、秒間100リクエストを捌け。SLA 99%必達。",
+    "budget": 500,
+    "sla_target": 0.99
+  },
+  "map": {
+    "fixed_nodes": [
+      { "id": "gateway", "type": "gateway", "x": 150, "y": 540 }
+    ]
+  },
+  "waves": [
+    {
+      "time_start_ms": 1000,
+      "source_id": "gateway",
+      "count": 50,
+      "duration_ms": 2000,
+      "packet_type": "NORMAL",
+      "speed": 5.0
+    },
+    {
+      "time_start_ms": 5000,
+      "source_id": "gateway",
+      "count": 200,
+      "duration_ms": 1000,
+      "packet_type": "NORMAL",
+      "speed": 6.0
+    }
+  ]
+}
+
