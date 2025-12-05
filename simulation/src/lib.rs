@@ -22,6 +22,8 @@ use wasm_bindgen::prelude::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageConfig {
     pub meta: StageMeta,
+    #[serde(default)]
+    pub grades: GradeDefinitions,
     pub map: MapConfig,
     pub waves: Vec<WaveConfig>,
 }
@@ -33,6 +35,26 @@ pub struct StageMeta {
     pub description: String,
     pub budget: u32,
     pub sla_target: f64,
+}
+
+/// グレード定義
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GradeDefinitions {
+    #[serde(default)]
+    pub lb: HashMap<String, GradeSpec>,
+    #[serde(default)]
+    pub server: HashMap<String, GradeSpec>,
+    #[serde(default)]
+    pub db: HashMap<String, GradeSpec>,
+}
+
+/// グレードのスペック
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradeSpec {
+    pub max_concurrent: u32,
+    pub process_time_ms: f64,
+    pub queue_capacity: u32,
+    pub cost: u32,
 }
 
 /// マップ設定（固定ノードなど）
@@ -47,6 +69,8 @@ pub struct FixedNodeConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub node_type: String,
+    #[serde(default)]
+    pub grade: Option<String>,
     pub x: i32,
     pub y: i32,
 }
@@ -511,18 +535,48 @@ pub fn simulation_get_active_count() -> usize {
     })
 }
 
+/// 負荷率から色を計算（緑→黄→赤のグラデーション）
+fn load_rate_to_color(load_rate: f32) -> (f32, f32, f32) {
+    if load_rate <= 0.0 {
+        // 負荷なし: 緑
+        (0.14, 0.53, 0.21)
+    } else if load_rate <= 0.5 {
+        // 0-50%: 緑 → 黄色
+        let t = load_rate / 0.5;
+        (
+            0.14 + t * (0.94 - 0.14),  // 緑 → 黄
+            0.53 + t * (0.73 - 0.53),
+            0.21 + t * (0.09 - 0.21),
+        )
+    } else if load_rate <= 1.0 {
+        // 50-100%: 黄色 → オレンジ
+        let t = (load_rate - 0.5) / 0.5;
+        (
+            0.94 + t * (0.97 - 0.94),  // 黄 → オレンジ
+            0.73 - t * (0.73 - 0.32),
+            0.09 - t * 0.09,
+        )
+    } else {
+        // 100%+: 赤
+        (0.97, 0.32, 0.29)
+    }
+}
+
 /// シミュレーションのパケットとノードをWebGPUで描画
 #[wasm_bindgen]
 pub fn render_simulation_frame() {
+    // ノードサイズ（外側=縁、内側=本体）
+    let node_outer_size = 24.0_f32;  // 外側（負荷色）
+    let node_inner_size = 16.0_f32;  // 内側（タイプ色）
+    
     // ノードタイプごとの色定義
     // Gateway: 緑, LB: 青, Server: 紫, DB: オレンジ
-    let node_colors: [(f32, f32, f32); 4] = [
+    let node_type_colors: [(f32, f32, f32); 4] = [
         (0.14, 0.53, 0.21),  // Gateway: #238636
         (0.12, 0.43, 0.92),  // LB: #1f6feb
         (0.54, 0.34, 0.90),  // Server: #8957e5
         (0.94, 0.53, 0.24),  // DB: #f0883e
     ];
-    let node_size = 20.0_f32;
     
     // パケットの色とサイズ
     let packet_color = (1.0_f32, 1.0_f32, 1.0_f32); // 白
@@ -533,24 +587,48 @@ pub fn render_simulation_frame() {
         let mut data: Vec<f32> = Vec::new();
         
         if let Some(sim) = state.borrow().as_ref() {
-            // 1. まずノードを追加（大きいので先に描画）
+            // 各ノードの負荷率を取得
+            let load_rates = sim.get_node_load_rates();
+            
+            // 1. ノードの外側（縁）を追加 - 負荷色
             for i in 0..sim.get_node_count() {
                 if let Some((x, y)) = sim.get_node_position_by_index(i) {
-                    // ノードタイプを取得（0=Gateway, 1=LB, 2=Server, 3=DB）
-                    let node_type = sim.get_node_type_by_index(i).unwrap_or(0) as usize;
-                    let color_idx = node_type.min(3); // 0-3の範囲に制限
-                    let (r, g, b) = node_colors[color_idx];
+                    let node_type = sim.get_node_type_by_index(i).unwrap_or(0);
+                    
+                    // 負荷率に応じた色（Gatewayは常に緑）
+                    let (r, g, b) = if node_type == 0 {
+                        (0.14, 0.53, 0.21) // Gateway: 緑
+                    } else {
+                        let load_rate = load_rates.get(i).copied().unwrap_or(0.0);
+                        load_rate_to_color(load_rate)
+                    };
                     
                     data.push(x);
                     data.push(y);
                     data.push(r);
                     data.push(g);
                     data.push(b);
-                    data.push(node_size);
+                    data.push(node_outer_size);
                 }
             }
             
-            // 2. 次にパケットを追加
+            // 2. ノードの内側を追加 - タイプ色
+            for i in 0..sim.get_node_count() {
+                if let Some((x, y)) = sim.get_node_position_by_index(i) {
+                    let node_type = sim.get_node_type_by_index(i).unwrap_or(0) as usize;
+                    let color_idx = node_type.min(3);
+                    let (r, g, b) = node_type_colors[color_idx];
+                    
+                    data.push(x);
+                    data.push(y);
+                    data.push(r);
+                    data.push(g);
+                    data.push(b);
+                    data.push(node_inner_size);
+                }
+            }
+            
+            // 3. パケットを追加
             let coords = sim.get_active_coords();
             for chunk in coords.chunks(2) {
                 if chunk.len() == 2 {
@@ -679,7 +757,8 @@ pub fn load_stage_config(json_str: &str) -> bool {
     let mut node_id_map: HashMap<String, usize> = HashMap::new();
     
     for (idx, node) in config.map.fixed_nodes.iter().enumerate() {
-        let node_type = match node.node_type.to_lowercase().as_str() {
+        let node_type_str = node.node_type.to_lowercase();
+        let node_type = match node_type_str.as_str() {
             "gateway" => 0,
             "lb" => 1,
             "server" => 2,
@@ -687,16 +766,42 @@ pub fn load_stage_config(json_str: &str) -> bool {
             _ => 0,
         };
         
+        // グレードからスペックを取得
+        let grade_spec = node.grade.as_ref().and_then(|grade_name| {
+            match node_type_str.as_str() {
+                "lb" => config.grades.lb.get(grade_name),
+                "server" => config.grades.server.get(grade_name),
+                "db" => config.grades.db.get(grade_name),
+                _ => None,
+            }
+        });
+        
         SIMULATION_STATE.with(|state| {
             if let Some(sim) = state.borrow_mut().as_mut() {
-                sim.add_node(idx as u32, node.x as f32, node.y as f32, node_type);
+                if let Some(spec) = grade_spec {
+                    // グレードスペック付きでノードを追加
+                    sim.add_node_with_spec(
+                        idx as u32,
+                        node.x as f32,
+                        node.y as f32,
+                        node_type,
+                        spec.max_concurrent,
+                        spec.process_time_ms,
+                        spec.queue_capacity,
+                        spec.cost,
+                    );
+                } else {
+                    // デフォルトスペックでノードを追加
+                    sim.add_node(idx as u32, node.x as f32, node.y as f32, node_type);
+                }
             }
         });
         
         node_id_map.insert(node.id.clone(), idx);
+        let grade_info = node.grade.as_deref().unwrap_or("default");
         log(&format!(
-            "[Rust/Wasm] Fixed node added: id={}, type={}, pos=({}, {})",
-            node.id, node.node_type, node.x, node.y
+            "[Rust/Wasm] Fixed node added: id={}, type={}, grade={}, pos=({}, {})",
+            node.id, node.node_type, grade_info, node.x, node.y
         ));
     }
 

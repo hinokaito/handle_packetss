@@ -5,14 +5,27 @@
     "budget": 500,
     "sla_target": 0.99
   },
+  "grades": {
+    "lb": {
+      "standard": { "max_concurrent": 100, "process_time_ms": 10, "queue_capacity": 500, "cost": 100 }
+    },
+    "server": {
+      "small":  { "max_concurrent": 5,   "process_time_ms": 100, "queue_capacity": 10,  "cost": 50  },
+      "medium": { "max_concurrent": 20,  "process_time_ms": 50,  "queue_capacity": 50,  "cost": 150 },
+      "large":  { "max_concurrent": 100, "process_time_ms": 20,  "queue_capacity": 200, "cost": 400 }
+    },
+    "db": {
+      "standard": { "max_concurrent": 10, "process_time_ms": 30, "queue_capacity": 100, "cost": 200 }
+    }
+  },
   "map": {
     "fixed_nodes": [
       { "id": "gateway", "type": "gateway", "x": 150, "y": 540 },
-      { "id": "lb", "type": "lb", "x": 500, "y": 540 },
-      { "id": "server1", "type": "server", "x": 900, "y": 300 },
-      { "id": "server2", "type": "server", "x": 900, "y": 540 },
-      { "id": "server3", "type": "server", "x": 900, "y": 780 },
-      { "id": "db", "type": "db", "x": 1300, "y": 540 }
+      { "id": "lb", "type": "lb", "grade": "standard", "x": 500, "y": 540 },
+      { "id": "server1", "type": "server", "grade": "medium", "x": 900, "y": 300 },
+      { "id": "server2", "type": "server", "grade": "medium", "x": 900, "y": 540 },
+      { "id": "server3", "type": "server", "grade": "small", "x": 900, "y": 780 },
+      { "id": "db", "type": "db", "grade": "standard", "x": 1300, "y": 540 }
     ]
   },
   "waves": [
