@@ -49,6 +49,7 @@ pub struct NodeSpec {
     pub process_time_ms: f64,   // 1パケットの処理時間（ミリ秒）
     pub queue_capacity: u32,    // 待機キュー容量
     pub cost: u32,              // 配置コスト
+    pub bandwidth_factor: f64,  // 帯域係数（0=サイズ無視、1=サイズに比例して遅延）
 }
 
 /// ノード構造体（目的地となるオブジェクト）
@@ -71,6 +72,7 @@ pub struct Node {
 pub struct ProcessingPacket {
     pub packet_idx: usize,      // パケットのインデックス
     pub remaining_time_ms: f64, // 残り処理時間
+    pub packet_size: f32,       // パケットサイズ（帯域計算用）
 }
 
 /// キュー内で待機中のパケット
@@ -88,24 +90,28 @@ impl Node {
                 process_time_ms: 0.0,
                 queue_capacity: 10000,
                 cost: 0,
+                bandwidth_factor: 0.0, // Gateway: サイズ影響なし
             },
-            1 => NodeSpec { // LB: 高スループット
+            1 => NodeSpec { // LB: 高スループット、帯域影響あり
                 max_concurrent: 100,
                 process_time_ms: 10.0,
                 queue_capacity: 500,
                 cost: 100,
+                bandwidth_factor: 0.5, // LB: パケットサイズの影響を受ける
             },
-            2 => NodeSpec { // Server: Medium相当
+            2 => NodeSpec { // Server: Medium相当、帯域影響大
                 max_concurrent: 20,
                 process_time_ms: 50.0,
                 queue_capacity: 50,
                 cost: 150,
+                bandwidth_factor: 0.3, // Server: 処理能力で帯域制限
             },
             3 => NodeSpec { // DB: 低スループット
                 max_concurrent: 10,
                 process_time_ms: 30.0,
                 queue_capacity: 100,
                 cost: 200,
+                bandwidth_factor: 0.2, // DB: I/O帯域制限
             },
             _ => NodeSpec::default(),
         };
@@ -164,6 +170,9 @@ pub struct Packet {
     pub speed: f32,           // 移動速度（ピクセル/フレーム）
     pub state: PacketState,   // 現在の状態
     pub current_node_idx: i32, // 現在いるノードのインデックス (-1 = 移動中)
+    pub is_response: bool,    // レスポンスパケットかどうか
+    pub size: f32,            // パケットサイズ（リクエスト: 1.0, レスポンス: 大きい値）
+    pub origin_server_idx: i32, // リクエスト時に通過したサーバーのインデックス (-1 = 未設定)
 }
 
 impl Default for Packet {
@@ -180,6 +189,9 @@ impl Default for Packet {
             speed: 3.0,
             state: PacketState::Moving,
             current_node_idx: -1,
+            is_response: false,
+            size: 1.0,  // デフォルトはリクエストサイズ
+            origin_server_idx: -1, // 未設定
         }
     }
 }
@@ -267,16 +279,26 @@ impl SimulationState {
         queue_capacity: u32,
         cost: u32,
     ) {
+        // ノードタイプに応じたデフォルト帯域係数
+        let bandwidth_factor = match node_type {
+            0 => 0.0,  // Gateway: サイズ影響なし
+            1 => 0.5,  // LB: パケットサイズの影響を受ける
+            2 => 0.3,  // Server: 処理能力で帯域制限
+            3 => 0.2,  // DB: I/O帯域制限
+            _ => 0.0,
+        };
+        
         let mut node = Node::new(id, x, y, node_type);
         node.spec = NodeSpec {
             max_concurrent,
             process_time_ms,
             queue_capacity,
             cost,
+            bandwidth_factor,
         };
         log(&format!(
-            "[Rust/Wasm] Node added with spec: id={}, type={}, max_concurrent={}, process_time={}ms, queue={}, cost={}",
-            id, node_type, max_concurrent, process_time_ms, queue_capacity, cost
+            "[Rust/Wasm] Node added with spec: id={}, type={}, max_concurrent={}, process_time={}ms, queue={}, cost={}, bw_factor={}",
+            id, node_type, max_concurrent, process_time_ms, queue_capacity, cost, bandwidth_factor
         ));
         self.nodes.push(node);
     }
@@ -658,14 +680,23 @@ impl SimulationState {
 
         let node_idx = target_node_idx as usize;
         
+        // パケットサイズを取得
+        let packet_size = self.packets[packet_idx].size;
+        
         // ノードの情報を取得
         let node_type = self.nodes[node_idx].node_type;
-        let process_time = self.nodes[node_idx].spec.process_time_ms;
+        let base_process_time = self.nodes[node_idx].spec.process_time_ms;
+        let bandwidth_factor = self.nodes[node_idx].spec.bandwidth_factor;
         let max_concurrent = self.nodes[node_idx].spec.max_concurrent;
         let queue_capacity = self.nodes[node_idx].spec.queue_capacity;
         let current_processing = self.nodes[node_idx].processing_packets.len() as u32;
         let current_queue = self.nodes[node_idx].queue.len() as u32;
         let node_pos = (self.nodes[node_idx].x, self.nodes[node_idx].y);
+
+        // パケットサイズに応じた処理時間を計算
+        // レスポンス（大きいパケット）は帯域を消費して処理が遅くなる
+        let size_multiplier = 1.0 + (packet_size as f64 - 1.0) * bandwidth_factor;
+        let adjusted_process_time = base_process_time * size_multiplier;
 
         // パケット位置をノード位置に更新
         self.packets[packet_idx].x = node_pos.0;
@@ -673,18 +704,24 @@ impl SimulationState {
         self.packets[packet_idx].current_node_idx = node_idx as i32;
 
         // 処理時間が0のノード（Gateway等）は即座に次へ転送
-        if process_time <= 0.0 {
+        if base_process_time <= 0.0 {
             self.route_packet_to_next(packet_idx, node_type, node_pos);
             return;
         }
 
+        // Serverノードの場合、リクエスト時に通過サーバーを記録
+        if node_type == 2 && !self.packets[packet_idx].is_response {
+            self.packets[packet_idx].origin_server_idx = node_idx as i32;
+        }
+
         // 負荷チェック: 処理可能か？
         if current_processing < max_concurrent {
-            // 処理開始
+            // 処理開始（サイズに応じた処理時間）
             self.packets[packet_idx].state = PacketState::Processing;
             self.nodes[node_idx].processing_packets.push(ProcessingPacket {
                 packet_idx,
-                remaining_time_ms: process_time,
+                remaining_time_ms: adjusted_process_time,
+                packet_size,
             });
         } else if current_queue < queue_capacity {
             // キューに追加
@@ -699,18 +736,70 @@ impl SimulationState {
     }
 
     /// パケットを次のノードへルーティング
+    /// リクエスト: Gateway -> LB -> Server -> DB
+    /// レスポンス: DB -> Server -> LB -> Gateway（逆方向、リクエスト時と同じサーバーを経由）
     fn route_packet_to_next(&mut self, packet_idx: usize, current_node_type: u32, current_pos: (f32, f32)) {
-        let next_node = match current_node_type {
-            0 => self.find_next_node_by_type(1), // Gateway -> LB
-            1 => self.find_next_server_target(), // LB -> Server (負荷分散)
-            2 => self.find_next_node_by_type(3), // Server -> DB
-            3 => {
-                // DB到達 = 処理完了
-                self.packets[packet_idx].active = 0;
-                self.stats.packets_processed += 1;
-                return;
+        let is_response = self.packets[packet_idx].is_response;
+        let origin_server_idx = self.packets[packet_idx].origin_server_idx;
+        
+        let next_node = if is_response {
+            // レスポンス: 逆方向にルーティング（リクエスト時と同じサーバーを経由）
+            match current_node_type {
+                3 => {
+                    // DB -> Server: リクエスト時に通ったサーバーに戻る
+                    if origin_server_idx >= 0 && (origin_server_idx as usize) < self.nodes.len() {
+                        Some(origin_server_idx as usize)
+                    } else {
+                        // フォールバック: 最初のServerを返す
+                        self.find_next_node_by_type(2)
+                    }
+                }
+                2 => self.find_next_node_by_type(1),           // Server -> LB
+                1 => self.find_next_node_by_type(0),           // LB -> Gateway
+                0 => {
+                    // Gateway到達 = レスポンス完了
+                    self.packets[packet_idx].active = 0;
+                    self.stats.packets_processed += 1;
+                    return;
+                }
+                _ => None,
             }
-            _ => None,
+        } else {
+            // リクエスト: 順方向にルーティング
+            match current_node_type {
+                0 => self.find_next_node_by_type(1), // Gateway -> LB
+                1 => self.find_next_server_target(), // LB -> Server (負荷分散)
+                2 => self.find_next_node_by_type(3), // Server -> DB
+                3 => {
+                    // DB到達 = リクエスト処理完了、レスポンスに変換
+                    let origin_server = self.packets[packet_idx].origin_server_idx;
+                    let p = &mut self.packets[packet_idx];
+                    p.is_response = true;
+                    p.size = 10.0;  // レスポンスはリクエストの10倍のサイズ
+                    p.target_node_idx = -1;
+                    p.current_node_idx = -1;
+                    p.state = PacketState::Moving;
+                    p.x = current_pos.0;
+                    p.y = current_pos.1;
+                    
+                    // DBから次のノード（元のServer）へ向かう
+                    let next_server = if origin_server >= 0 && (origin_server as usize) < self.nodes.len() {
+                        Some(origin_server as usize)
+                    } else {
+                        self.find_next_node_by_type(2)
+                    };
+                    
+                    if let Some(next_idx) = next_server {
+                        self.packets[packet_idx].target_node_idx = next_idx as i32;
+                    } else {
+                        // 次がない場合は完了扱い
+                        self.packets[packet_idx].active = 0;
+                        self.stats.packets_processed += 1;
+                    }
+                    return;
+                }
+                _ => None,
+            }
         };
 
         if let Some(next_idx) = next_node {
@@ -755,9 +844,20 @@ impl SimulationState {
                 && !node.queue.is_empty()
             {
                 let queued = node.queue.remove(0);
+                
+                // パケットサイズに応じた処理時間を計算
+                let packet_size = if queued.packet_idx < self.packets.len() {
+                    self.packets[queued.packet_idx].size
+                } else {
+                    1.0
+                };
+                let size_multiplier = 1.0 + (packet_size as f64 - 1.0) * node.spec.bandwidth_factor;
+                let adjusted_process_time = node.spec.process_time_ms * size_multiplier;
+                
                 node.processing_packets.push(ProcessingPacket {
                     packet_idx: queued.packet_idx,
-                    remaining_time_ms: node.spec.process_time_ms,
+                    remaining_time_ms: adjusted_process_time,
+                    packet_size,
                 });
                 // パケットの状態を更新
                 if queued.packet_idx < self.packets.len() {
@@ -823,6 +923,21 @@ impl SimulationState {
             }
         }
         coords
+    }
+    
+    /// アクティブなパケットの詳細情報を取得（描画用）
+    /// 戻り値: [x, y, is_response(0.0/1.0), size] の配列
+    pub fn get_active_packet_details(&self) -> Vec<f32> {
+        let mut details = Vec::new();
+        for packet in &self.packets {
+            if packet.active == 1 {
+                details.push(packet.x);
+                details.push(packet.y);
+                details.push(if packet.is_response { 1.0 } else { 0.0 });
+                details.push(packet.size);
+            }
+        }
+        details
     }
 
     /// 各ノードの負荷率を取得（0.0 - 1.0+）

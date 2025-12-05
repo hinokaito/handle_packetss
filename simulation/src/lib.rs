@@ -578,9 +578,13 @@ pub fn render_simulation_frame() {
         (0.94, 0.53, 0.24),  // DB: #f0883e
     ];
     
-    // パケットの色とサイズ
-    let packet_color = (1.0_f32, 1.0_f32, 1.0_f32); // 白
-    let packet_size = 3.0_f32;
+    // パケットの色定義
+    let request_color = (1.0_f32, 1.0_f32, 1.0_f32);   // リクエスト: 白
+    let response_color = (0.0_f32, 0.85_f32, 1.0_f32); // レスポンス: 水色 (#00d9ff)
+    
+    // パケットサイズ定義
+    let request_size = 3.0_f32;   // リクエスト: 小さい
+    let response_size = 6.0_f32;  // レスポンス: 大きい
 
     // エンティティデータを構築: [x, y, r, g, b, size] per entity
     let entity_data = SIMULATION_STATE.with(|state| {
@@ -628,16 +632,29 @@ pub fn render_simulation_frame() {
                 }
             }
             
-            // 3. パケットを追加
-            let coords = sim.get_active_coords();
-            for chunk in coords.chunks(2) {
-                if chunk.len() == 2 {
-                    data.push(chunk[0]); // x
-                    data.push(chunk[1]); // y
-                    data.push(packet_color.0);
-                    data.push(packet_color.1);
-                    data.push(packet_color.2);
-                    data.push(packet_size);
+            // 3. パケットを追加（リクエスト/レスポンスで色とサイズを変える）
+            let packet_details = sim.get_active_packet_details();
+            // packet_details: [x, y, is_response, size] の繰り返し
+            for chunk in packet_details.chunks(4) {
+                if chunk.len() == 4 {
+                    let x = chunk[0];
+                    let y = chunk[1];
+                    let is_response = chunk[2] > 0.5;  // is_response フラグ
+                    let _packet_size_factor = chunk[3]; // パケットサイズ（将来の帯域計算用）
+                    
+                    // リクエスト/レスポンスで色とサイズを変える
+                    let (r, g, b, size) = if is_response {
+                        (response_color.0, response_color.1, response_color.2, response_size)
+                    } else {
+                        (request_color.0, request_color.1, request_color.2, request_size)
+                    };
+                    
+                    data.push(x);
+                    data.push(y);
+                    data.push(r);
+                    data.push(g);
+                    data.push(b);
+                    data.push(size);
                 }
             }
         }
