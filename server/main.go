@@ -51,11 +51,19 @@ type Wave struct {
 	Speed       float64 `json:"speed"`
 }
 
-// StageListItem はステージ一覧用の簡易情報
+// StageListItem はステージ一覧用の簡易情報（manifest.jsonから読み込む）
 type StageListItem struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
+	ID            string  `json:"id"`
+	Title         string  `json:"title"`
+	Description   string  `json:"description"`
+	Budget        int     `json:"budget"`
+	SLATarget     float64 `json:"sla_target"`
+	RequiredLevel int     `json:"required_level"`
+}
+
+// Manifest はmanifest.jsonの構造
+type Manifest struct {
+	Stages []StageListItem `json:"stages"`
 }
 
 // =============================================================================
@@ -82,6 +90,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // =============================================================================
 
 const stagesDir = "stages"
+const manifestFile = "manifest.json"
 
 // loadStageConfig はJSONファイルからステージ設定を読み込む
 func loadStageConfig(stageID string) (*StageConfig, error) {
@@ -99,34 +108,29 @@ func loadStageConfig(stageID string) (*StageConfig, error) {
 	return &config, nil
 }
 
-// listStages はstagesディレクトリ内の全ステージを一覧取得
-func listStages() ([]StageListItem, error) {
-	entries, err := os.ReadDir(stagesDir)
+// loadManifest はmanifest.jsonからステージ一覧を読み込む
+func loadManifest() (*Manifest, error) {
+	data, err := os.ReadFile(manifestFile)
 	if err != nil {
 		return nil, err
 	}
 
-	var stages []StageListItem
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-
-		stageID := strings.TrimSuffix(entry.Name(), ".json")
-		config, err := loadStageConfig(stageID)
-		if err != nil {
-			log.Printf("Warning: failed to load stage %s: %v", stageID, err)
-			continue
-		}
-
-		stages = append(stages, StageListItem{
-			ID:          stageID,
-			Title:       config.Meta.Title,
-			Description: config.Meta.Description,
-		})
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, err
 	}
 
-	return stages, nil
+	return &manifest, nil
+}
+
+// listStages はmanifest.jsonからステージ一覧を取得
+func listStages() ([]StageListItem, error) {
+	manifest, err := loadManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	return manifest.Stages, nil
 }
 
 // =============================================================================
