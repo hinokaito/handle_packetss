@@ -42,19 +42,115 @@ pub enum NodeType {
     DB = 3,      // データベース
 }
 
+/// ノードスペック（グレードごとの性能）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NodeSpec {
+    pub max_concurrent: u32,    // 同時処理可能数
+    pub process_time_ms: f64,   // 1パケットの処理時間（ミリ秒）
+    pub queue_capacity: u32,    // 待機キュー容量
+    pub cost: u32,              // 配置コスト
+}
+
 /// ノード構造体（目的地となるオブジェクト）
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Node {
     pub x: f32,
     pub y: f32,
     pub id: u32,        // ユニークID（JS側での管理用）
     pub node_type: u32, // NodeType as u32
+    pub spec: NodeSpec, // 性能スペック
+    // 状態（動的）
+    pub processing_packets: Vec<ProcessingPacket>, // 処理中のパケット
+    pub queue: Vec<QueuedPacket>,                  // 待機キュー
+    pub total_processed: u32,                       // 処理完了数
+    pub total_dropped: u32,                         // ドロップ数
+}
+
+/// 処理中のパケット情報
+#[derive(Clone, Debug)]
+pub struct ProcessingPacket {
+    pub packet_idx: usize,      // パケットのインデックス
+    pub remaining_time_ms: f64, // 残り処理時間
+}
+
+/// キュー内で待機中のパケット
+#[derive(Clone, Debug)]
+pub struct QueuedPacket {
+    pub packet_idx: usize,
+}
+
+impl Node {
+    pub fn new(id: u32, x: f32, y: f32, node_type: u32) -> Self {
+        // デフォルトスペック（node_typeに応じて設定）
+        let spec = match node_type {
+            0 => NodeSpec { // Gateway: 無制限（通過のみ）
+                max_concurrent: 10000,
+                process_time_ms: 0.0,
+                queue_capacity: 10000,
+                cost: 0,
+            },
+            1 => NodeSpec { // LB: 高スループット
+                max_concurrent: 100,
+                process_time_ms: 10.0,
+                queue_capacity: 500,
+                cost: 100,
+            },
+            2 => NodeSpec { // Server: Medium相当
+                max_concurrent: 20,
+                process_time_ms: 50.0,
+                queue_capacity: 50,
+                cost: 150,
+            },
+            3 => NodeSpec { // DB: 低スループット
+                max_concurrent: 10,
+                process_time_ms: 30.0,
+                queue_capacity: 100,
+                cost: 200,
+            },
+            _ => NodeSpec::default(),
+        };
+
+        Node {
+            x,
+            y,
+            id,
+            node_type,
+            spec,
+            processing_packets: Vec::new(),
+            queue: Vec::new(),
+            total_processed: 0,
+            total_dropped: 0,
+        }
+    }
+
+    /// 現在の処理中パケット数
+    pub fn current_load(&self) -> u32 {
+        self.processing_packets.len() as u32
+    }
+
+    /// キュー内パケット数
+    pub fn queue_size(&self) -> u32 {
+        self.queue.len() as u32
+    }
+
+    /// 負荷率（0.0 - 1.0+）
+    pub fn load_rate(&self) -> f32 {
+        if self.spec.max_concurrent == 0 {
+            return 0.0;
+        }
+        self.current_load() as f32 / self.spec.max_concurrent as f32
+    }
+}
+
+/// パケット状態
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PacketState {
+    Moving = 0,     // 移動中
+    Processing = 1, // ノードで処理中
+    Queued = 2,     // ノードのキューで待機中
 }
 
 /// シミュレーション用パケット構造体
-/// WebGPUに渡すため#[repr(C)]でメモリレイアウトを固定
-#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Packet {
     pub x: f32,
@@ -64,9 +160,10 @@ pub struct Packet {
     pub active: u32,          // 0: inactive, 1: active
     pub packet_type: u32,     // PacketType as u32
     pub complexity: u8,       // 処理の重さ係数
-    pub _padding: [u8; 3],    // アライメント用パディング
     pub target_node_idx: i32, // 目標ノードのインデックス (-1 = 宛先なし)
     pub speed: f32,           // 移動速度（ピクセル/フレーム）
+    pub state: PacketState,   // 現在の状態
+    pub current_node_idx: i32, // 現在いるノードのインデックス (-1 = 移動中)
 }
 
 impl Default for Packet {
@@ -79,9 +176,10 @@ impl Default for Packet {
             active: 0,
             packet_type: 0,
             complexity: 0,
-            _padding: [0; 3],
-            target_node_idx: -1, // 宛先なし
-            speed: 3.0,          // デフォルト速度
+            target_node_idx: -1,
+            speed: 3.0,
+            state: PacketState::Moving,
+            current_node_idx: -1,
         }
     }
 }
@@ -149,16 +247,38 @@ impl SimulationState {
 
     /// ノードを追加（JSから呼び出し）
     pub fn add_node(&mut self, id: u32, x: f32, y: f32, node_type: u32) {
-        self.nodes.push(Node {
-            x,
-            y,
-            id,
-            node_type,
-        });
+        let node = Node::new(id, x, y, node_type);
         log(&format!(
-            "[Rust/Wasm] Node added: id={}, pos=({}, {}), type={}",
-            id, x, y, node_type
+            "[Rust/Wasm] Node added: id={}, pos=({}, {}), type={}, max_concurrent={}, process_time={}ms",
+            id, x, y, node_type, node.spec.max_concurrent, node.spec.process_time_ms
         ));
+        self.nodes.push(node);
+    }
+
+    /// スペック付きでノードを追加
+    pub fn add_node_with_spec(
+        &mut self,
+        id: u32,
+        x: f32,
+        y: f32,
+        node_type: u32,
+        max_concurrent: u32,
+        process_time_ms: f64,
+        queue_capacity: u32,
+        cost: u32,
+    ) {
+        let mut node = Node::new(id, x, y, node_type);
+        node.spec = NodeSpec {
+            max_concurrent,
+            process_time_ms,
+            queue_capacity,
+            cost,
+        };
+        log(&format!(
+            "[Rust/Wasm] Node added with spec: id={}, type={}, max_concurrent={}, process_time={}ms, queue={}, cost={}",
+            id, node_type, max_concurrent, process_time_ms, queue_capacity, cost
+        ));
+        self.nodes.push(node);
     }
 
     /// すべてのノードをクリア
@@ -301,7 +421,10 @@ impl SimulationState {
         // 1. spawn_queueを処理: 予約に基づいてパケットを生成
         self.process_spawn_queue();
 
-        // 2. アクティブなパケットを更新
+        // 2. ノードでの処理時間を進める
+        self.process_nodes(delta_ms);
+
+        // 3. アクティブなパケットを更新
         self.update_packets(delta_ms);
     }
 
@@ -464,15 +587,15 @@ impl SimulationState {
         }
     }
 
-    /// アクティブなパケットの位置を更新
+    /// アクティブなパケットの位置を更新（移動中のパケットのみ）
     fn update_packets(&mut self, _delta_ms: f64) {
         // 到達したパケットのインデックスを収集
         let mut arrived_packets: Vec<usize> = Vec::new();
 
         // まずパケットの移動処理（不変借用でノードを参照）
         for (idx, packet) in self.packets.iter_mut().enumerate() {
-            if packet.active == 1 {
-                // ノードターゲットモード
+            if packet.active == 1 && packet.state == PacketState::Moving {
+                // 移動中のパケットのみ処理
                 if packet.target_node_idx >= 0
                     && (packet.target_node_idx as usize) < self.nodes.len()
                 {
@@ -523,80 +646,132 @@ impl SimulationState {
         }
     }
 
-    /// パケットがターゲットノードに到達したときの処理
+    /// パケットがターゲットノードに到達したときの処理（負荷モデル対応）
     fn handle_packet_arrival(&mut self, packet_idx: usize) {
-        // Rustの借用ルール回避のため、必要な情報をコピーして取得
-        let (target_node_idx, _packet_type) = {
-            let p = &self.packets[packet_idx];
-            (p.target_node_idx, p.packet_type)
-        };
+        let target_node_idx = self.packets[packet_idx].target_node_idx;
 
         // ターゲットが存在しないなら終了
-        if target_node_idx < 0 {
+        if target_node_idx < 0 || (target_node_idx as usize) >= self.nodes.len() {
             self.packets[packet_idx].active = 0;
             return;
         }
 
-        // 到達したノードの情報を取得
-        let node_type = self.nodes[target_node_idx as usize].node_type;
-        let current_node_pos = (
-            self.nodes[target_node_idx as usize].x,
-            self.nodes[target_node_idx as usize].y,
-        );
+        let node_idx = target_node_idx as usize;
+        
+        // ノードの情報を取得
+        let node_type = self.nodes[node_idx].node_type;
+        let process_time = self.nodes[node_idx].spec.process_time_ms;
+        let max_concurrent = self.nodes[node_idx].spec.max_concurrent;
+        let queue_capacity = self.nodes[node_idx].spec.queue_capacity;
+        let current_processing = self.nodes[node_idx].processing_packets.len() as u32;
+        let current_queue = self.nodes[node_idx].queue.len() as u32;
+        let node_pos = (self.nodes[node_idx].x, self.nodes[node_idx].y);
 
-        match node_type {
-            0 => {
-                // Type 0: Gateway (入口)
-                // Gateway -> LBへルーティング
-                if let Some(next_idx) = self.find_next_node_by_type(1) {
-                    let p = &mut self.packets[packet_idx];
-                    p.target_node_idx = next_idx as i32;
-                    p.x = current_node_pos.0;
-                    p.y = current_node_pos.1;
-                } else {
-                    // LBがない = ドロップ
-                    self.packets[packet_idx].active = 0;
-                    self.stats.packets_dropped += 1;
-                }
-            }
-            1 => {
-                // Type 1: Load Balancer (LB)
-                // LB -> Serverへルーティング（ラウンドロビン的に分散）
-                if let Some(next_idx) = self.find_next_server_target() {
-                    let p = &mut self.packets[packet_idx];
-                    p.target_node_idx = next_idx as i32;
-                    p.x = current_node_pos.0;
-                    p.y = current_node_pos.1;
-                } else {
-                    // Serverがない = ドロップ
-                    self.packets[packet_idx].active = 0;
-                    self.stats.packets_dropped += 1;
-                }
-            }
-            2 => {
-                // Type 2: Server
-                // Server -> DBへルーティング
-                if let Some(next_idx) = self.find_next_node_by_type(3) {
-                    let p = &mut self.packets[packet_idx];
-                    p.target_node_idx = next_idx as i32;
-                    p.x = current_node_pos.0;
-                    p.y = current_node_pos.1;
-                } else {
-                    // DBがない = ドロップ
-                    self.packets[packet_idx].active = 0;
-                    self.stats.packets_dropped += 1;
-                }
-            }
+        // パケット位置をノード位置に更新
+        self.packets[packet_idx].x = node_pos.0;
+        self.packets[packet_idx].y = node_pos.1;
+        self.packets[packet_idx].current_node_idx = node_idx as i32;
+
+        // 処理時間が0のノード（Gateway等）は即座に次へ転送
+        if process_time <= 0.0 {
+            self.route_packet_to_next(packet_idx, node_type, node_pos);
+            return;
+        }
+
+        // 負荷チェック: 処理可能か？
+        if current_processing < max_concurrent {
+            // 処理開始
+            self.packets[packet_idx].state = PacketState::Processing;
+            self.nodes[node_idx].processing_packets.push(ProcessingPacket {
+                packet_idx,
+                remaining_time_ms: process_time,
+            });
+        } else if current_queue < queue_capacity {
+            // キューに追加
+            self.packets[packet_idx].state = PacketState::Queued;
+            self.nodes[node_idx].queue.push(QueuedPacket { packet_idx });
+        } else {
+            // ドロップ！
+            self.packets[packet_idx].active = 0;
+            self.nodes[node_idx].total_dropped += 1;
+            self.stats.packets_dropped += 1;
+        }
+    }
+
+    /// パケットを次のノードへルーティング
+    fn route_packet_to_next(&mut self, packet_idx: usize, current_node_type: u32, current_pos: (f32, f32)) {
+        let next_node = match current_node_type {
+            0 => self.find_next_node_by_type(1), // Gateway -> LB
+            1 => self.find_next_server_target(), // LB -> Server (負荷分散)
+            2 => self.find_next_node_by_type(3), // Server -> DB
             3 => {
-                // Type 3: DB
-                // DB到達 = リクエスト処理完了（成功）
+                // DB到達 = 処理完了
                 self.packets[packet_idx].active = 0;
                 self.stats.packets_processed += 1;
+                return;
             }
-            _ => {
-                // その他（不明なノード = ドロップ扱い）
-                self.packets[packet_idx].active = 0;
-                self.stats.packets_dropped += 1;
+            _ => None,
+        };
+
+        if let Some(next_idx) = next_node {
+            let p = &mut self.packets[packet_idx];
+            p.target_node_idx = next_idx as i32;
+            p.current_node_idx = -1; // 移動中
+            p.state = PacketState::Moving;
+            p.x = current_pos.0;
+            p.y = current_pos.1;
+        } else {
+            // 次のノードがない = ドロップ
+            self.packets[packet_idx].active = 0;
+            self.stats.packets_dropped += 1;
+        }
+    }
+
+    /// ノードでの処理時間を進め、完了したパケットを次へ送る
+    fn process_nodes(&mut self, delta_ms: f64) {
+        // 処理完了したパケットを収集
+        let mut completed: Vec<(usize, usize)> = Vec::new(); // (node_idx, packet_idx)
+
+        // 各ノードの処理時間を減算
+        for (node_idx, node) in self.nodes.iter_mut().enumerate() {
+            let mut completed_indices = Vec::new();
+            
+            for (i, proc) in node.processing_packets.iter_mut().enumerate() {
+                proc.remaining_time_ms -= delta_ms;
+                if proc.remaining_time_ms <= 0.0 {
+                    completed_indices.push(i);
+                    completed.push((node_idx, proc.packet_idx));
+                }
+            }
+
+            // 処理完了したものを削除（逆順）
+            for i in completed_indices.into_iter().rev() {
+                node.processing_packets.remove(i);
+                node.total_processed += 1;
+            }
+
+            // キューから次のパケットを処理開始
+            while node.processing_packets.len() < node.spec.max_concurrent as usize
+                && !node.queue.is_empty()
+            {
+                let queued = node.queue.remove(0);
+                node.processing_packets.push(ProcessingPacket {
+                    packet_idx: queued.packet_idx,
+                    remaining_time_ms: node.spec.process_time_ms,
+                });
+                // パケットの状態を更新
+                if queued.packet_idx < self.packets.len() {
+                    self.packets[queued.packet_idx].state = PacketState::Processing;
+                }
+            }
+        }
+
+        // 処理完了したパケットを次のノードへルーティング
+        for (node_idx, packet_idx) in completed {
+            if packet_idx < self.packets.len() && self.packets[packet_idx].active == 1 {
+                let node_type = self.nodes[node_idx].node_type;
+                let node_pos = (self.nodes[node_idx].x, self.nodes[node_idx].y);
+                self.route_packet_to_next(packet_idx, node_type, node_pos);
             }
         }
     }
@@ -611,24 +786,30 @@ impl SimulationState {
         None
     }
 
-    /// ロードバランシング: Serverノードをラウンドロビン的に選択
-    /// 複数のServerがある場合、ランダムに選択
+    /// ロードバランシング: 最も負荷の低いServerを選択
     fn find_next_server_target(&self) -> Option<usize> {
         // node_type == 2 (Server) のノードを収集
-        let servers: Vec<usize> = self
+        let servers: Vec<(usize, f32)> = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| node.node_type == 2)
-            .map(|(i, _)| i)
+            .map(|(i, node)| {
+                // 負荷率 = (処理中 + キュー) / max_concurrent
+                let load = (node.processing_packets.len() + node.queue.len()) as f32
+                    / node.spec.max_concurrent.max(1) as f32;
+                (i, load)
+            })
             .collect();
 
         if servers.is_empty() {
             None
         } else {
-            // ランダムに1つ選択
-            let random_idx = (js_random() * servers.len() as f32) as usize;
-            Some(servers[random_idx.min(servers.len() - 1)])
+            // 最も負荷の低いサーバーを選択
+            servers
+                .iter()
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| *idx)
         }
     }
 
@@ -642,5 +823,22 @@ impl SimulationState {
             }
         }
         coords
+    }
+
+    /// 各ノードの負荷率を取得（0.0 - 1.0+）
+    /// 戻り値: [node0_load, node1_load, ...]
+    pub fn get_node_load_rates(&self) -> Vec<f32> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                if node.spec.max_concurrent == 0 {
+                    0.0
+                } else {
+                    // 処理中 + キュー待ちの合計を考慮
+                    let total_load = node.processing_packets.len() + node.queue.len();
+                    total_load as f32 / node.spec.max_concurrent as f32
+                }
+            })
+            .collect()
     }
 }
