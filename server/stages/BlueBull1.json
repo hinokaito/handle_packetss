@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Stage 1: First Access",
+    "title": "BlueBull",
     "description": "予算$500以内で、秒間100リクエストを捌け。SLA 99%必達。",
     "budget": 500,
     "sla_target": 0.99
